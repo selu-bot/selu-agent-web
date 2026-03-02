@@ -14,6 +14,7 @@ import signal
 import threading
 from concurrent import futures
 from typing import Any
+from urllib.parse import urlparse
 
 import grpc
 import capability_pb2
@@ -90,9 +91,32 @@ class BrowserManager:
 
             self._pw = sync_playwright().start()
 
-            # Respect egress proxy injected by the orchestrator
-            proxy_url = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-            proxy_settings = {"server": proxy_url} if proxy_url else None
+            # Respect egress proxy injected by the orchestrator.
+            # The URL may contain credentials (e.g. http://user:token@host:port)
+            # that Playwright needs as explicit username/password fields.
+            proxy_url = (
+                os.environ.get("HTTPS_PROXY")
+                or os.environ.get("https_proxy")
+                or os.environ.get("HTTP_PROXY")
+                or os.environ.get("http_proxy")
+            )
+            proxy_settings = None
+            if proxy_url:
+                parsed = urlparse(proxy_url)
+                # Reconstruct server URL without embedded credentials
+                server = f"{parsed.scheme}://{parsed.hostname}"
+                if parsed.port:
+                    server += f":{parsed.port}"
+                proxy_settings = {"server": server}
+                if parsed.username:
+                    proxy_settings["username"] = parsed.username
+                if parsed.password:
+                    proxy_settings["password"] = parsed.password
+                log.info(
+                    "Proxy configured: server=%s, authenticated=%s",
+                    server,
+                    bool(parsed.username),
+                )
 
             self._browser = self._pw.chromium.launch(
                 headless=True,
