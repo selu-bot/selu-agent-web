@@ -120,6 +120,7 @@ class BrowserManager:
 
             self._browser = self._pw.chromium.launch(
                 headless=True,
+                proxy=proxy_settings,
                 args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
@@ -135,7 +136,6 @@ class BrowserManager:
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                 ),
-                proxy=proxy_settings,
                 ignore_https_errors=True,
             )
 
