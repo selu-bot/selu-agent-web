@@ -13,7 +13,7 @@ RUN python -m grpc_tools.protoc \
     --grpc_python_out=. \
     capability.proto
 
-# ---- Stage 2: Runtime with Playwright + Chromium ----
+# ---- Stage 2: Runtime with Playwright + real Google Chrome ----
 FROM mcr.microsoft.com/playwright/python:v1.52.0-noble
 
 WORKDIR /app
@@ -23,8 +23,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install only Chromium (skip Firefox and WebKit to save space)
-RUN playwright install chromium
+# Install real Google Chrome (not the bundled Chromium).
+# Real Chrome passes more anti-bot fingerprint checks than Playwright's
+# bundled Chromium, which is detected and blocked by services like
+# Akamai Bot Manager (e.g. disneylandparis.de).
+# --with-deps ensures system-level dependencies (fonts, libs) are installed.
+RUN playwright install --with-deps chrome
 
 # Copy generated gRPC stubs from builder
 COPY --from=builder /build/capability_pb2.py /build/capability_pb2_grpc.py ./

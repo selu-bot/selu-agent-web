@@ -75,6 +75,9 @@ class BrowserManager:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        self._cdp_session = None
+        self._proxy_username: str | None = None
+        self._proxy_password: str | None = None
         self._element_map: dict[int, dict] = {}
         self._lock = threading.Lock()
 
@@ -87,33 +90,48 @@ class BrowserManager:
             if self._page is not None:
                 return self._page
 
-            log.info("Starting Playwright and launching Chromium...")
+            log.info("Starting Playwright and launching Chrome...")
 
             self._pw = sync_playwright().start()
 
             # Respect egress proxy injected by the orchestrator.
             # The URL contains credentials (e.g. http://selu:token@host:port).
-            # Playwright needs them as explicit username/password fields and
-            # relies on the proxy responding with 407 to trigger the auth
-            # handshake — Chromium never sends Proxy-Authorization proactively.
+            #
+            # IMPORTANT: We do NOT use Playwright's proxy={username, password}
+            # parameter.  When credentials are passed that way, Playwright
+            # configures Chromium via CDP in a manner that causes certain
+            # sites (e.g. google.com) to hang — Chromium opens the CONNECT
+            # tunnel but never sends any data through it.
+            #
+            # Instead, we pass --proxy-server as a Chromium flag and handle
+            # the 407 Proxy Authentication challenge ourselves via the CDP
+            # Fetch domain (Fetch.authRequired event).  This is the same
+            # mechanism Chrome DevTools uses and works reliably with all sites.
             proxy_url = (
                 os.environ.get("HTTPS_PROXY")
                 or os.environ.get("https_proxy")
                 or os.environ.get("HTTP_PROXY")
                 or os.environ.get("http_proxy")
             )
-            proxy_settings = None
+
+            launch_args = [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-blink-features=AutomationControlled",
+            ]
+
             if proxy_url:
                 parsed = urlparse(proxy_url)
                 # Reconstruct server URL without embedded credentials
                 server = f"{parsed.scheme}://{parsed.hostname}"
                 if parsed.port:
                     server += f":{parsed.port}"
-                proxy_settings = {"server": server}
-                if parsed.username:
-                    proxy_settings["username"] = parsed.username
-                if parsed.password:
-                    proxy_settings["password"] = parsed.password
+                launch_args.append(f"--proxy-server={server}")
+                self._proxy_username = parsed.username
+                self._proxy_password = parsed.password
                 log.info(
                     "Proxy configured: server=%s, authenticated=%s",
                     server,
@@ -122,14 +140,8 @@ class BrowserManager:
 
             self._browser = self._pw.chromium.launch(
                 headless=True,
-                proxy=proxy_settings,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-extensions",
-                ],
+                channel="chrome",
+                args=launch_args,
             )
 
             self._context = self._browser.new_context(
@@ -150,8 +162,72 @@ class BrowserManager:
             # Dismiss simple dialogs automatically
             self._page.on("dialog", lambda d: d.dismiss())
 
+            # Set up CDP Fetch domain for proxy authentication.
+            # Chromium follows RFC 7235: it sends CONNECT without credentials,
+            # expects a 407 with Proxy-Authenticate, and retries with creds.
+            # We intercept the 407 challenge via CDP and supply credentials.
+            if self._proxy_username:
+                self._setup_cdp_proxy_auth(self._page)
+
             log.info("Browser ready.")
             return self._page
+
+    def _setup_cdp_proxy_auth(self, page: Page) -> None:
+        """Set up CDP Fetch domain to handle proxy 407 auth challenges.
+
+        Instead of relying on Playwright's proxy={username, password} (which
+        causes Chromium to hang on certain sites like google.com), we use the
+        CDP Fetch domain to intercept 407 challenges and respond with
+        credentials programmatically.
+        """
+        cdp = page.context.new_cdp_session(page)
+        self._cdp_session = cdp
+
+        username = self._proxy_username
+        password = self._proxy_password
+
+        def on_auth_required(event: dict) -> None:
+            challenge = event.get("authChallenge", {})
+            request_id = event.get("requestId")
+            if challenge.get("source") == "Proxy":
+                log.debug("CDP: proxy auth challenge for %s", request_id)
+                cdp.send(
+                    "Fetch.continueWithAuth",
+                    {
+                        "requestId": request_id,
+                        "authChallengeResponse": {
+                            "response": "ProvideCredentials",
+                            "username": username,
+                            "password": password,
+                        },
+                    },
+                )
+            else:
+                # Not a proxy challenge — cancel so the browser handles it
+                log.debug("CDP: non-proxy auth challenge, cancelling: %s", challenge)
+                cdp.send(
+                    "Fetch.continueWithAuth",
+                    {
+                        "requestId": request_id,
+                        "authChallengeResponse": {"response": "CancelAuth"},
+                    },
+                )
+
+        def on_request_paused(event: dict) -> None:
+            request_id = event.get("requestId")
+            cdp.send("Fetch.continueRequest", {"requestId": request_id})
+
+        cdp.on("Fetch.authRequired", on_auth_required)
+        cdp.on("Fetch.requestPaused", on_request_paused)
+
+        cdp.send(
+            "Fetch.enable",
+            {
+                "handleAuthRequests": True,
+                "patterns": [{"requestStage": "Response"}],
+            },
+        )
+        log.info("CDP Fetch proxy auth handler installed.")
 
     @property
     def page(self) -> Page:
@@ -428,6 +504,11 @@ class BrowserManager:
 
     def close(self) -> None:
         log.info("Closing browser...")
+        try:
+            if self._cdp_session:
+                self._cdp_session.detach()
+        except Exception:
+            pass
         try:
             if self._context:
                 self._context.close()
