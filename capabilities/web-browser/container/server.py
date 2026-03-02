@@ -92,32 +92,19 @@ class BrowserManager:
             self._pw = sync_playwright().start()
 
             # Respect egress proxy injected by the orchestrator.
-            # The URL may contain credentials (e.g. http://user:token@host:port)
-            # that Playwright needs as explicit username/password fields.
+            # The URL contains credentials (e.g. http://selu:token@host:port).
+            # Playwright needs them as explicit username/password fields and
+            # relies on the proxy responding with 407 to trigger the auth
+            # handshake — Chromium never sends Proxy-Authorization proactively.
             proxy_url = (
                 os.environ.get("HTTPS_PROXY")
                 or os.environ.get("https_proxy")
                 or os.environ.get("HTTP_PROXY")
                 or os.environ.get("http_proxy")
             )
-            log.info(
-                "Proxy env: HTTPS_PROXY=%s, HTTP_PROXY=%s, https_proxy=%s, http_proxy=%s",
-                os.environ.get("HTTPS_PROXY"),
-                os.environ.get("HTTP_PROXY"),
-                os.environ.get("https_proxy"),
-                os.environ.get("http_proxy"),
-            )
             proxy_settings = None
             if proxy_url:
                 parsed = urlparse(proxy_url)
-                log.info(
-                    "Parsed proxy URL: scheme=%s, hostname=%s, port=%s, username=%s, has_password=%s",
-                    parsed.scheme,
-                    parsed.hostname,
-                    parsed.port,
-                    parsed.username,
-                    bool(parsed.password),
-                )
                 # Reconstruct server URL without embedded credentials
                 server = f"{parsed.scheme}://{parsed.hostname}"
                 if parsed.port:
@@ -128,29 +115,21 @@ class BrowserManager:
                 if parsed.password:
                     proxy_settings["password"] = parsed.password
                 log.info(
-                    "Playwright proxy settings: %s",
-                    {k: (v if k != "password" else "***") for k, v in proxy_settings.items()},
+                    "Proxy configured: server=%s, authenticated=%s",
+                    server,
+                    bool(parsed.username),
                 )
-
-            launch_args = [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-            ]
-
-            # Force Chromium to route all traffic through the proxy by passing
-            # the --proxy-server flag directly.  Playwright's proxy= kwarg on
-            # launch() is supposed to do this, but in practice Chromium can
-            # ignore it.  The explicit flag is authoritative.
-            if proxy_settings:
-                launch_args.append(f"--proxy-server={proxy_settings['server']}")
-                log.info("Added --proxy-server=%s to Chromium args", proxy_settings["server"])
 
             self._browser = self._pw.chromium.launch(
                 headless=True,
-                args=launch_args,
+                proxy=proxy_settings,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-extensions",
+                ],
             )
 
             self._context = self._browser.new_context(
@@ -159,7 +138,6 @@ class BrowserManager:
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                 ),
-                proxy=proxy_settings,
                 ignore_https_errors=True,
             )
 
@@ -494,6 +472,7 @@ def handle_navigate(args: dict) -> str:
             "partial_snapshot": browser_mgr.take_snapshot(max_text_length=2000),
         })
     except Exception as exc:
+        log.warning("Navigation to %s failed: %s", url, exc)
         return json.dumps({"error": f"Failed to navigate to {url}: {exc}"})
 
     return json.dumps({
