@@ -128,12 +128,15 @@ jobs:
       # -- Notify Selu marketplace --
 
       - name: Notify Selu marketplace
-        if: secrets.SELU_WEBHOOK_URL != '' && secrets.SELU_WEBHOOK_TOKEN != ''
+        if: env.SELU_WEBHOOK_URL != '' && env.SELU_WEBHOOK_TOKEN != ''
         continue-on-error: true
+        env:
+          SELU_WEBHOOK_URL: ${{ secrets.SELU_WEBHOOK_URL }}
+          SELU_WEBHOOK_TOKEN: ${{ secrets.SELU_WEBHOOK_TOKEN }}
         run: |
           curl -sf -X POST \
-            "${{ secrets.SELU_WEBHOOK_URL }}" \
-            -H "Authorization: Bearer ${{ secrets.SELU_WEBHOOK_TOKEN }}" \
+            "${SELU_WEBHOOK_URL}" \
+            -H "Authorization: Bearer ${SELU_WEBHOOK_TOKEN}" \
             -H "Content-Type: application/json" \
             -d '{
               "version": "${{ steps.version.outputs.version }}",
