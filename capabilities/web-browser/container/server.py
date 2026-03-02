@@ -7,6 +7,7 @@ session.  Each tool call returns structured text that the LLM can reason about.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -20,8 +21,8 @@ import grpc
 import capability_pb2
 import capability_pb2_grpc
 
-from playwright.sync_api import (
-    sync_playwright,
+from playwright.async_api import (
+    async_playwright,
     Browser,
     BrowserContext,
     Page,
@@ -34,6 +35,29 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("web-browser")
+
+# ---------------------------------------------------------------------------
+# Dedicated asyncio event loop — runs on a daemon thread so that async
+# Playwright calls can be dispatched from synchronous gRPC handler threads.
+# ---------------------------------------------------------------------------
+
+_async_loop = asyncio.new_event_loop()
+
+
+def _start_async_loop(loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+_async_thread = threading.Thread(target=_start_async_loop, args=(_async_loop,), daemon=True)
+_async_thread.start()
+
+
+def _run_async(coro):
+    """Submit a coroutine to the dedicated event loop and block until it completes."""
+    future = asyncio.run_coroutine_threadsafe(coro, _async_loop)
+    return future.result()
+
 
 # ---------------------------------------------------------------------------
 # Session state store — simple in-memory dict, persists across Invoke calls
@@ -68,7 +92,11 @@ class SessionState:
 # ---------------------------------------------------------------------------
 
 class BrowserManager:
-    """Manages a single Playwright browser instance and page."""
+    """Manages a single Playwright browser instance and page.
+
+    All Playwright operations are async and run on a dedicated event loop
+    thread (_async_loop).  Synchronous callers use _run_async() to bridge.
+    """
 
     def __init__(self) -> None:
         self._pw: Playwright | None = None
@@ -79,20 +107,20 @@ class BrowserManager:
         self._proxy_username: str | None = None
         self._proxy_password: str | None = None
         self._element_map: dict[int, dict] = {}
-        self._lock = threading.Lock()
+        self._init_lock = asyncio.Lock()
 
-    def _ensure_browser(self) -> Page:
+    async def _ensure_browser(self) -> Page:
         """Lazily start the browser on first use."""
         if self._page is not None:
             return self._page
 
-        with self._lock:
+        async with self._init_lock:
             if self._page is not None:
                 return self._page
 
             log.info("Starting Playwright and launching Chrome...")
 
-            self._pw = sync_playwright().start()
+            self._pw = await async_playwright().start()
 
             # Respect egress proxy injected by the orchestrator.
             # The URL contains credentials (e.g. http://selu:token@host:port).
@@ -138,13 +166,13 @@ class BrowserManager:
                     bool(parsed.username),
                 )
 
-            self._browser = self._pw.chromium.launch(
+            self._browser = await self._pw.chromium.launch(
                 headless=True,
                 channel="chrome",
                 args=launch_args,
             )
 
-            self._context = self._browser.new_context(
+            self._context = await self._browser.new_context(
                 viewport={"width": 1280, "height": 960},
                 user_agent=(
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -157,22 +185,24 @@ class BrowserManager:
             self._context.set_default_timeout(30_000)
             self._context.set_default_navigation_timeout(30_000)
 
-            self._page = self._context.new_page()
+            self._page = await self._context.new_page()
 
             # Dismiss simple dialogs automatically
-            self._page.on("dialog", lambda d: d.dismiss())
+            async def _dismiss_dialog(d):
+                await d.dismiss()
+            self._page.on("dialog", _dismiss_dialog)
 
             # Set up CDP Fetch domain for proxy authentication.
             # Chromium follows RFC 7235: it sends CONNECT without credentials,
             # expects a 407 with Proxy-Authenticate, and retries with creds.
             # We intercept the 407 challenge via CDP and supply credentials.
             if self._proxy_username:
-                self._setup_cdp_proxy_auth(self._page)
+                await self._setup_cdp_proxy_auth(self._page)
 
             log.info("Browser ready.")
             return self._page
 
-    def _setup_cdp_proxy_auth(self, page: Page) -> None:
+    async def _setup_cdp_proxy_auth(self, page: Page) -> None:
         """Set up CDP Fetch domain to handle proxy 407 auth challenges.
 
         Instead of relying on Playwright's proxy={username, password} (which
@@ -180,18 +210,18 @@ class BrowserManager:
         CDP Fetch domain to intercept 407 challenges and respond with
         credentials programmatically.
         """
-        cdp = page.context.new_cdp_session(page)
+        cdp = await page.context.new_cdp_session(page)
         self._cdp_session = cdp
 
         username = self._proxy_username
         password = self._proxy_password
 
-        def on_auth_required(event: dict) -> None:
+        async def on_auth_required(event: dict) -> None:
             challenge = event.get("authChallenge", {})
             request_id = event.get("requestId")
             if challenge.get("source") == "Proxy":
                 log.debug("CDP: proxy auth challenge for %s", request_id)
-                cdp.send(
+                await cdp.send(
                     "Fetch.continueWithAuth",
                     {
                         "requestId": request_id,
@@ -205,7 +235,7 @@ class BrowserManager:
             else:
                 # Not a proxy challenge — cancel so the browser handles it
                 log.debug("CDP: non-proxy auth challenge, cancelling: %s", challenge)
-                cdp.send(
+                await cdp.send(
                     "Fetch.continueWithAuth",
                     {
                         "requestId": request_id,
@@ -213,14 +243,14 @@ class BrowserManager:
                     },
                 )
 
-        def on_request_paused(event: dict) -> None:
+        async def on_request_paused(event: dict) -> None:
             request_id = event.get("requestId")
-            cdp.send("Fetch.continueRequest", {"requestId": request_id})
+            await cdp.send("Fetch.continueRequest", {"requestId": request_id})
 
         cdp.on("Fetch.authRequired", on_auth_required)
         cdp.on("Fetch.requestPaused", on_request_paused)
 
-        cdp.send(
+        await cdp.send(
             "Fetch.enable",
             {
                 "handleAuthRequests": True,
@@ -229,9 +259,9 @@ class BrowserManager:
         )
         log.info("CDP Fetch proxy auth handler installed.")
 
-    @property
-    def page(self) -> Page:
-        return self._ensure_browser()
+    async def get_page(self) -> Page:
+        """Get the current page, launching the browser if needed."""
+        return await self._ensure_browser()
 
     @property
     def element_map(self) -> dict[int, dict]:
@@ -239,15 +269,15 @@ class BrowserManager:
 
     # ----- snapshot ----------------------------------------------------------
 
-    def take_snapshot(self, max_text_length: int = 5000) -> str:
+    async def take_snapshot(self, max_text_length: int = 5000) -> str:
         """Build a text representation of the current page state."""
-        page = self.page
+        page = await self.get_page()
 
         url = page.url
-        title = page.title()
+        title = await page.title()
 
         # Collect interactive elements
-        elements = self._collect_interactive_elements()
+        elements = await self._collect_interactive_elements()
         self._element_map = {e["index"]: e for e in elements}
 
         lines: list[str] = []
@@ -266,7 +296,7 @@ class BrowserManager:
         lines.append("=== Page Text ===")
 
         try:
-            text = page.inner_text("body") or ""
+            text = await page.inner_text("body") or ""
         except Exception:
             text = ""
 
@@ -290,9 +320,9 @@ class BrowserManager:
 
         return "\n".join(lines)
 
-    def _collect_interactive_elements(self) -> list[dict]:
+    async def _collect_interactive_elements(self) -> list[dict]:
         """Query the DOM for interactive elements and return structured info."""
-        page = self.page
+        page = await self.get_page()
 
         # JavaScript that runs in the browser to enumerate interactive elements.
         # Returns a JSON-serialisable list.
@@ -378,7 +408,7 @@ class BrowserManager:
         """
 
         try:
-            raw = page.evaluate(js)
+            raw = await page.evaluate(js)
         except Exception as exc:
             log.warning("Failed to collect interactive elements: %s", exc)
             return []
@@ -458,11 +488,11 @@ class BrowserManager:
 
     # ----- element resolution -----------------------------------------------
 
-    def resolve_element(self, element_index: int | None = None,
-                        selector: str | None = None,
-                        text: str | None = None) -> Any:
+    async def resolve_element(self, element_index: int | None = None,
+                              selector: str | None = None,
+                              text: str | None = None) -> Any:
         """Resolve an element from index, selector, or text match."""
-        page = self.page
+        page = await self.get_page()
 
         if element_index is not None:
             el_info = self._element_map.get(element_index)
@@ -491,7 +521,7 @@ class BrowserManager:
             # Try common patterns: links, buttons, then any visible text
             for role in ["link", "button"]:
                 loc = page.get_by_role(role, name=text)
-                if loc.count() > 0:
+                if await loc.count() > 0:
                     return loc.first
             # Fall back to text match
             return page.get_by_text(text, exact=False).first
@@ -502,26 +532,26 @@ class BrowserManager:
 
     # ----- cleanup -----------------------------------------------------------
 
-    def close(self) -> None:
+    async def close(self) -> None:
         log.info("Closing browser...")
         try:
             if self._cdp_session:
-                self._cdp_session.detach()
+                await self._cdp_session.detach()
         except Exception:
             pass
         try:
             if self._context:
-                self._context.close()
+                await self._context.close()
         except Exception:
             pass
         try:
             if self._browser:
-                self._browser.close()
+                await self._browser.close()
         except Exception:
             pass
         try:
             if self._pw:
-                self._pw.stop()
+                await self._pw.stop()
         except Exception:
             pass
         log.info("Browser closed.")
@@ -544,57 +574,68 @@ def handle_navigate(args: dict) -> str:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    page = browser_mgr.page
-    try:
-        page.goto(url, wait_until="domcontentloaded")
-    except PlaywrightTimeout:
-        return json.dumps({
-            "error": f"Timed out loading {url}. The page may still be loading.",
-            "partial_snapshot": browser_mgr.take_snapshot(max_text_length=2000),
-        })
-    except Exception as exc:
-        log.warning("Navigation to %s failed: %s", url, exc)
-        return json.dumps({"error": f"Failed to navigate to {url}: {exc}"})
+    async def _navigate():
+        page = await browser_mgr.get_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded")
+        except PlaywrightTimeout:
+            return json.dumps({
+                "error": f"Timed out loading {url}. The page may still be loading.",
+                "partial_snapshot": await browser_mgr.take_snapshot(max_text_length=2000),
+            })
+        except Exception as exc:
+            log.warning("Navigation to %s failed: %s", url, exc)
+            return json.dumps({"error": f"Failed to navigate to {url}: {exc}"})
 
-    return json.dumps({
-        "status": "ok",
-        "snapshot": browser_mgr.take_snapshot(),
-    })
+        return json.dumps({
+            "status": "ok",
+            "snapshot": await browser_mgr.take_snapshot(),
+        })
+
+    return _run_async(_navigate())
 
 
 def handle_get_page_snapshot(args: dict) -> str:
     max_len = args.get("max_text_length", 5000)
-    return json.dumps({
-        "snapshot": browser_mgr.take_snapshot(max_text_length=max_len),
-    })
+
+    async def _snapshot():
+        return json.dumps({
+            "snapshot": await browser_mgr.take_snapshot(max_text_length=max_len),
+        })
+
+    return _run_async(_snapshot())
 
 
 def handle_click(args: dict) -> str:
-    try:
-        locator = browser_mgr.resolve_element(
-            element_index=args.get("element_index"),
-            selector=args.get("selector"),
-            text=args.get("text"),
-        )
-    except ValueError as exc:
-        return json.dumps({"error": str(exc)})
+    async def _click():
+        try:
+            locator = await browser_mgr.resolve_element(
+                element_index=args.get("element_index"),
+                selector=args.get("selector"),
+                text=args.get("text"),
+            )
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
 
-    try:
-        locator.click(timeout=10_000)
-        # Wait briefly for potential navigation or DOM changes
-        browser_mgr.page.wait_for_load_state("domcontentloaded", timeout=5_000)
-    except PlaywrightTimeout:
-        pass  # Page may not navigate — that's fine
-    except Exception as exc:
+        try:
+            await locator.click(timeout=10_000)
+            # Wait briefly for potential navigation or DOM changes
+            page = await browser_mgr.get_page()
+            await page.wait_for_load_state("domcontentloaded", timeout=5_000)
+        except PlaywrightTimeout:
+            pass  # Page may not navigate — that's fine
+        except Exception as exc:
+            return json.dumps({
+                "error": f"Click failed: {exc}",
+                "snapshot": await browser_mgr.take_snapshot(max_text_length=2000),
+            })
+
         return json.dumps({
-            "error": f"Click failed: {exc}",
-            "snapshot": browser_mgr.take_snapshot(max_text_length=2000),
+            "status": "ok",
+            "snapshot": await browser_mgr.take_snapshot(),
         })
 
-    return json.dumps({
-        "status": "ok",
-        "snapshot": browser_mgr.take_snapshot(),
-    })
+    return _run_async(_click())
 
 
 def handle_fill(args: dict) -> str:
@@ -604,51 +645,57 @@ def handle_fill(args: dict) -> str:
 
     clear_first = args.get("clear_first", True)
 
-    try:
-        locator = browser_mgr.resolve_element(
-            element_index=args.get("element_index"),
-            selector=args.get("selector"),
-        )
-    except ValueError as exc:
-        return json.dumps({"error": str(exc)})
+    async def _fill():
+        try:
+            locator = await browser_mgr.resolve_element(
+                element_index=args.get("element_index"),
+                selector=args.get("selector"),
+            )
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
 
-    try:
-        if clear_first:
-            locator.fill(value, timeout=10_000)
-        else:
-            locator.press_sequentially(value, delay=50, timeout=10_000)
-    except Exception as exc:
-        return json.dumps({"error": f"Fill failed: {exc}"})
+        try:
+            if clear_first:
+                await locator.fill(value, timeout=10_000)
+            else:
+                await locator.press_sequentially(value, delay=50, timeout=10_000)
+        except Exception as exc:
+            return json.dumps({"error": f"Fill failed: {exc}"})
 
-    return json.dumps({
-        "status": "ok",
-        "filled": value if len(value) <= 50 else value[:47] + "...",
-    })
+        return json.dumps({
+            "status": "ok",
+            "filled": value if len(value) <= 50 else value[:47] + "...",
+        })
+
+    return _run_async(_fill())
 
 
 def handle_select_option(args: dict) -> str:
-    try:
-        locator = browser_mgr.resolve_element(
-            element_index=args.get("element_index"),
-            selector=args.get("selector"),
-        )
-    except ValueError as exc:
-        return json.dumps({"error": str(exc)})
+    async def _select():
+        try:
+            locator = await browser_mgr.resolve_element(
+                element_index=args.get("element_index"),
+                selector=args.get("selector"),
+            )
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
 
-    value = args.get("value")
-    label = args.get("label")
+        value = args.get("value")
+        label = args.get("label")
 
-    try:
-        if label:
-            locator.select_option(label=label, timeout=10_000)
-        elif value:
-            locator.select_option(value=value, timeout=10_000)
-        else:
-            return json.dumps({"error": "Provide either 'value' or 'label'."})
-    except Exception as exc:
-        return json.dumps({"error": f"Select failed: {exc}"})
+        try:
+            if label:
+                await locator.select_option(label=label, timeout=10_000)
+            elif value:
+                await locator.select_option(value=value, timeout=10_000)
+            else:
+                return json.dumps({"error": "Provide either 'value' or 'label'."})
+        except Exception as exc:
+            return json.dumps({"error": f"Select failed: {exc}"})
 
-    return json.dumps({"status": "ok"})
+        return json.dumps({"status": "ok"})
+
+    return _run_async(_select())
 
 
 def handle_press_key(args: dict) -> str:
@@ -656,79 +703,88 @@ def handle_press_key(args: dict) -> str:
     if not key:
         return json.dumps({"error": "key is required"})
 
-    page = browser_mgr.page
+    async def _press_key():
+        page = await browser_mgr.get_page()
 
-    # Optionally focus an element first
-    el_index = args.get("element_index")
-    selector = args.get("selector")
-    if el_index is not None or selector is not None:
+        # Optionally focus an element first
+        el_index = args.get("element_index")
+        selector = args.get("selector")
+        if el_index is not None or selector is not None:
+            try:
+                locator = await browser_mgr.resolve_element(
+                    element_index=el_index,
+                    selector=selector,
+                )
+                await locator.focus(timeout=5_000)
+            except Exception as exc:
+                return json.dumps({"error": f"Could not focus element: {exc}"})
+
         try:
-            locator = browser_mgr.resolve_element(
-                element_index=el_index,
-                selector=selector,
-            )
-            locator.focus(timeout=5_000)
+            await page.keyboard.press(key)
+            # Brief wait for any navigation or DOM update
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=3_000)
+            except PlaywrightTimeout:
+                pass
         except Exception as exc:
-            return json.dumps({"error": f"Could not focus element: {exc}"})
+            return json.dumps({"error": f"Key press failed: {exc}"})
 
-    try:
-        page.keyboard.press(key)
-        # Brief wait for any navigation or DOM update
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=3_000)
-        except PlaywrightTimeout:
-            pass
-    except Exception as exc:
-        return json.dumps({"error": f"Key press failed: {exc}"})
+        return json.dumps({
+            "status": "ok",
+            "snapshot": await browser_mgr.take_snapshot(),
+        })
 
-    return json.dumps({
-        "status": "ok",
-        "snapshot": browser_mgr.take_snapshot(),
-    })
+    return _run_async(_press_key())
 
 
 def handle_scroll(args: dict) -> str:
     direction = args.get("direction", "down")
     amount = args.get("amount", "page")
 
-    page = browser_mgr.page
+    async def _scroll():
+        page = await browser_mgr.get_page()
 
-    if amount == "page":
-        pixels = 960  # match viewport height
-    else:
+        if amount == "page":
+            pixels = 960  # match viewport height
+        else:
+            try:
+                pixels = int(amount)
+            except (ValueError, TypeError):
+                pixels = 960
+
+        if direction == "up":
+            pixels = -pixels
+
         try:
-            pixels = int(amount)
-        except (ValueError, TypeError):
-            pixels = 960
+            await page.evaluate(f"window.scrollBy(0, {pixels})")
+            await page.wait_for_timeout(500)  # let lazy-loaded content appear
+        except Exception as exc:
+            return json.dumps({"error": f"Scroll failed: {exc}"})
 
-    if direction == "up":
-        pixels = -pixels
+        return json.dumps({
+            "status": "ok",
+            "snapshot": await browser_mgr.take_snapshot(),
+        })
 
-    try:
-        page.evaluate(f"window.scrollBy(0, {pixels})")
-        page.wait_for_timeout(500)  # let lazy-loaded content appear
-    except Exception as exc:
-        return json.dumps({"error": f"Scroll failed: {exc}"})
-
-    return json.dumps({
-        "status": "ok",
-        "snapshot": browser_mgr.take_snapshot(),
-    })
+    return _run_async(_scroll())
 
 
 def handle_go_back(args: dict) -> str:
-    page = browser_mgr.page
-    try:
-        page.go_back(wait_until="domcontentloaded", timeout=15_000)
-    except PlaywrightTimeout:
-        pass
-    except Exception as exc:
-        return json.dumps({"error": f"Go back failed: {exc}"})
+    async def _go_back():
+        page = await browser_mgr.get_page()
+        try:
+            await page.go_back(wait_until="domcontentloaded", timeout=15_000)
+        except PlaywrightTimeout:
+            pass
+        except Exception as exc:
+            return json.dumps({"error": f"Go back failed: {exc}"})
 
-    return json.dumps({
-        "status": "ok",
-        "snapshot": browser_mgr.take_snapshot(),
-    })
+        return json.dumps({
+            "status": "ok",
+            "snapshot": await browser_mgr.take_snapshot(),
+        })
+
+    return _run_async(_go_back())
 
 
 def handle_wait(args: dict) -> str:
@@ -737,21 +793,24 @@ def handle_wait(args: dict) -> str:
         return json.dumps({"error": "selector is required"})
 
     timeout_sec = args.get("timeout_seconds", 10)
-    page = browser_mgr.page
 
-    try:
-        page.wait_for_selector(selector, timeout=timeout_sec * 1000)
-        return json.dumps({
-            "status": "found",
-            "selector": selector,
-        })
-    except PlaywrightTimeout:
-        return json.dumps({
-            "status": "timeout",
-            "message": f"Element '{selector}' did not appear within {timeout_sec}s.",
-        })
-    except Exception as exc:
-        return json.dumps({"error": f"Wait failed: {exc}"})
+    async def _wait():
+        page = await browser_mgr.get_page()
+        try:
+            await page.wait_for_selector(selector, timeout=timeout_sec * 1000)
+            return json.dumps({
+                "status": "found",
+                "selector": selector,
+            })
+        except PlaywrightTimeout:
+            return json.dumps({
+                "status": "timeout",
+                "message": f"Element '{selector}' did not appear within {timeout_sec}s.",
+            })
+        except Exception as exc:
+            return json.dumps({"error": f"Wait failed: {exc}"})
+
+    return _run_async(_wait())
 
 
 def handle_execute_javascript(args: dict) -> str:
@@ -759,15 +818,18 @@ def handle_execute_javascript(args: dict) -> str:
     if not script:
         return json.dumps({"error": "script is required"})
 
-    page = browser_mgr.page
-    try:
-        result = page.evaluate(script)
-        return json.dumps({
-            "status": "ok",
-            "result": result,
-        })
-    except Exception as exc:
-        return json.dumps({"error": f"JavaScript execution failed: {exc}"})
+    async def _exec_js():
+        page = await browser_mgr.get_page()
+        try:
+            result = await page.evaluate(script)
+            return json.dumps({
+                "status": "ok",
+                "result": result,
+            })
+        except Exception as exc:
+            return json.dumps({"error": f"JavaScript execution failed: {exc}"})
+
+    return _run_async(_exec_js())
 
 
 def handle_save_state(args: dict) -> str:
@@ -917,7 +979,7 @@ def serve() -> None:
 
     log.info("Stopping gRPC server...")
     server.stop(grace=5)
-    browser_mgr.close()
+    _run_async(browser_mgr.close())
     log.info("Server stopped.")
 
 
