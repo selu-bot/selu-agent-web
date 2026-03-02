@@ -700,6 +700,18 @@ TOOL_HANDLERS = {
     "load_state": handle_load_state,
 }
 
+# Maps tool name -> primary required parameter name, used to recover when the
+# orchestrator sends a bare value instead of a JSON object (e.g. when Bedrock
+# streaming fails to parse tool args and falls back to a raw string).
+TOOL_PRIMARY_PARAM: dict[str, str] = {
+    "navigate": "url",
+    "press_key": "key",
+    "scroll": "direction",
+    "wait": "selector",
+    "execute_javascript": "script",
+    "fill": "value",
+}
+
 
 # ---------------------------------------------------------------------------
 # gRPC servicer
@@ -723,9 +735,31 @@ class CapabilityServicer(capability_pb2_grpc.CapabilityServicer):
         try:
             args = json.loads(request.args_json) if request.args_json else {}
         except json.JSONDecodeError as exc:
-            return capability_pb2.InvokeResponse(
-                error=f"Invalid JSON arguments: {exc}"
-            )
+            # args_json was not valid JSON at all — try to use the raw
+            # bytes as a string value for the tool's primary parameter.
+            raw = request.args_json.decode("utf-8", errors="replace") if isinstance(request.args_json, bytes) else str(request.args_json)
+            primary = TOOL_PRIMARY_PARAM.get(tool)
+            if primary:
+                log.warning("args_json was not valid JSON for tool %s, treating raw value as '%s'", tool, primary)
+                args = {primary: raw}
+            else:
+                return capability_pb2.InvokeResponse(
+                    error=f"Invalid JSON arguments: {exc}"
+                )
+
+        # Handle the case where args_json was valid JSON but decoded to a
+        # non-object type (e.g. a bare string like '"https://example.com"').
+        # This happens when the orchestrator's streaming parser fails and
+        # falls back to sending the raw string from the LLM.
+        if not isinstance(args, dict):
+            primary = TOOL_PRIMARY_PARAM.get(tool)
+            if primary:
+                log.warning("args for tool %s was %s instead of dict, wrapping as {'%s': ...}", tool, type(args).__name__, primary)
+                args = {primary: args}
+            else:
+                return capability_pb2.InvokeResponse(
+                    error=f"Expected JSON object for tool arguments, got {type(args).__name__}"
+                )
 
         try:
             result = handler(args)
