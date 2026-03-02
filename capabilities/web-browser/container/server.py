@@ -132,16 +132,25 @@ class BrowserManager:
                     {k: (v if k != "password" else "***") for k, v in proxy_settings.items()},
                 )
 
+            launch_args = [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+            ]
+
+            # Force Chromium to route all traffic through the proxy by passing
+            # the --proxy-server flag directly.  Playwright's proxy= kwarg on
+            # launch() is supposed to do this, but in practice Chromium can
+            # ignore it.  The explicit flag is authoritative.
+            if proxy_settings:
+                launch_args.append(f"--proxy-server={proxy_settings['server']}")
+                log.info("Added --proxy-server=%s to Chromium args", proxy_settings["server"])
+
             self._browser = self._pw.chromium.launch(
                 headless=True,
-                proxy=proxy_settings,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-extensions",
-                ],
+                args=launch_args,
             )
 
             self._context = self._browser.new_context(
@@ -150,6 +159,7 @@ class BrowserManager:
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                 ),
+                proxy=proxy_settings,
                 ignore_https_errors=True,
             )
 
