@@ -100,9 +100,24 @@ class BrowserManager:
                 or os.environ.get("HTTP_PROXY")
                 or os.environ.get("http_proxy")
             )
+            log.info(
+                "Proxy env: HTTPS_PROXY=%s, HTTP_PROXY=%s, https_proxy=%s, http_proxy=%s",
+                os.environ.get("HTTPS_PROXY"),
+                os.environ.get("HTTP_PROXY"),
+                os.environ.get("https_proxy"),
+                os.environ.get("http_proxy"),
+            )
             proxy_settings = None
             if proxy_url:
                 parsed = urlparse(proxy_url)
+                log.info(
+                    "Parsed proxy URL: scheme=%s, hostname=%s, port=%s, username=%s, has_password=%s",
+                    parsed.scheme,
+                    parsed.hostname,
+                    parsed.port,
+                    parsed.username,
+                    bool(parsed.password),
+                )
                 # Reconstruct server URL without embedded credentials
                 server = f"{parsed.scheme}://{parsed.hostname}"
                 if parsed.port:
@@ -113,9 +128,8 @@ class BrowserManager:
                 if parsed.password:
                     proxy_settings["password"] = parsed.password
                 log.info(
-                    "Proxy configured: server=%s, authenticated=%s",
-                    server,
-                    bool(parsed.username),
+                    "Playwright proxy settings: %s",
+                    {k: (v if k != "password" else "***") for k, v in proxy_settings.items()},
                 )
 
             self._browser = self._pw.chromium.launch(
