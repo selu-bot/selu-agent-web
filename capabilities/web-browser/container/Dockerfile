@@ -1,5 +1,5 @@
 # ---- Stage 1: Build gRPC stubs from proto ----
-FROM python:3.12-slim AS builder
+FROM --platform=linux/amd64 python:3.12-slim AS builder
 
 WORKDIR /build
 
@@ -14,7 +14,9 @@ RUN python -m grpc_tools.protoc \
     capability.proto
 
 # ---- Stage 2: Runtime with Playwright + real Google Chrome ----
-FROM mcr.microsoft.com/playwright/python:v1.52.0-noble
+# Force amd64: Google Chrome does not ship for Linux ARM64.
+# On ARM hosts (e.g. Apple Silicon) this runs under Rosetta/QEMU emulation.
+FROM --platform=linux/amd64 mcr.microsoft.com/playwright/python:v1.52.0-noble
 
 WORKDIR /app
 
