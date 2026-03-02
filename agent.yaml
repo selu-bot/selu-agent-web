@@ -1,0 +1,9 @@
+id: web
+name: Web Assistant
+routing: inline
+session:
+  trigger: mention
+  idle_timeout_minutes: 30
+memory:
+  policy: none
+  top_k: 0
