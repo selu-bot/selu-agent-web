@@ -128,7 +128,7 @@ jobs:
       # -- Notify Selu marketplace --
 
       - name: Notify Selu marketplace
-        if: ${{ secrets.SELU_WEBHOOK_URL != '' && secrets.SELU_WEBHOOK_TOKEN != '' }}
+        if: secrets.SELU_WEBHOOK_URL != '' && secrets.SELU_WEBHOOK_TOKEN != ''
         continue-on-error: true
         run: |
           curl -sf -X POST \
