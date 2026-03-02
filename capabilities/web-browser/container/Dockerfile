@@ -4,7 +4,7 @@ FROM python:3.12-slim AS builder
 WORKDIR /build
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir grpcio-tools protobuf
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY capability.proto .
 RUN python -m grpc_tools.protoc \
