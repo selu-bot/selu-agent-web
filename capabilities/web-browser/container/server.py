@@ -1,7 +1,7 @@
 """
 Selu Web Browser Capability — gRPC server with Playwright-based browser automation.
 
-Maintains a persistent Chromium browser instance across Invoke calls within a
+Maintains a persistent browser instance across Invoke calls within a
 session.  Each tool call returns structured text that the LLM can reason about.
 """
 
@@ -12,10 +12,13 @@ import json
 import logging
 import os
 import signal
+import shutil
+import subprocess
 import threading
 from concurrent import futures
+from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import grpc
 import capability_pb2
@@ -133,32 +136,71 @@ class BrowserManager:
         self._browser: AsyncBrowser | None = None
         self._context: AsyncBrowserContext | None = None
         self._page: AsyncPage | None = None
-        self._cdp_session = None
-        self._proxy_username: str | None = None
-        self._proxy_password: str | None = None
         self._element_map: dict[int, dict] = {}
+        self._chrome_log_file = Path(
+            os.environ.get("CHROME_LOG_FILE", "/tmp/chrome-debug.log")
+        )
 
     async def ensure_page(self) -> AsyncPage:
         """Lazily start the browser on first use."""
-        if self._page is not None:
+        if self._page is not None and not self._page.is_closed():
             return self._page
 
-        log.info("Starting Playwright and launching Chrome...")
-        await self._setup()
-        log.info("Browser ready.")
-        return self._page
+        if self._page is not None and self._page.is_closed():
+            log.warning("Existing page is closed; resetting browser runtime.")
+            await self._cleanup_runtime()
 
-    async def _setup(self) -> None:
+        self._log_launch_environment()
+
+        last_exc: Exception | None = None
+        for channel in self._candidate_channels():
+            label = channel
+            log.info("Starting Playwright and launching %s...", label)
+            self._prepare_chrome_log_file()
+            try:
+                await self._setup(channel=channel)
+                log.info("Browser ready (%s).", label)
+                return self._page
+            except Exception as exc:
+                last_exc = exc
+                log.exception("Browser setup failed (%s): %s", label, exc)
+                self._log_chrome_stderr_tail()
+                await self._cleanup_runtime()
+
+        raise RuntimeError("Unable to start browser context with Chrome.") from last_exc
+
+    def _candidate_channels(self) -> list[str]:
+        """Return launch candidates in order (Chrome-only by default)."""
+        preferred = os.environ.get("PLAYWRIGHT_CHANNEL", "chrome").strip()
+        return [preferred or "chrome"]
+
+    async def _setup(self, channel: str) -> None:
         """Full browser setup using the async Playwright API."""
         self._pw = await async_playwright().start()
         log.info("Using Playwright Async API.")
 
-        proxy_url, launch_args = self._get_proxy_and_launch_args()
+        proxy, launch_args = self._get_proxy_and_launch_args()
+        launch_options: dict[str, Any] = {
+            "headless": True,
+            "args": launch_args,
+            "env": {
+                **os.environ,
+                "CHROME_LOG_FILE": str(self._chrome_log_file),
+            },
+        }
+        if channel:
+            launch_options["channel"] = channel
+        if proxy:
+            launch_options["proxy"] = proxy
 
-        self._browser = await self._pw.chromium.launch(
-            headless=True,
-            channel="chrome",
-            args=launch_args,
+        self._browser = await self._pw.chromium.launch(**launch_options)
+        if not self._browser.is_connected():
+            raise RuntimeError(
+                f"Browser disconnected immediately after launch (channel={channel!r})."
+            )
+        self._browser.on(
+            "disconnected",
+            lambda: log.warning("Browser process disconnected."),
         )
 
         self._context = await self._browser.new_context(
@@ -179,64 +221,11 @@ class BrowserManager:
             await d.dismiss()
         self._page.on("dialog", _dismiss)
 
-        if self._proxy_username:
-            await self._setup_cdp_proxy_auth(self._page)
-
-    async def _setup_cdp_proxy_auth(self, page) -> None:
-        """Set up CDP Fetch domain to handle proxy 407 auth challenges."""
-        cdp = await page.context.new_cdp_session(page)
-        self._cdp_session = cdp
-
-        username = self._proxy_username
-        password = self._proxy_password
-
-        async def on_auth_required(event: dict) -> None:
-            challenge = event.get("authChallenge", {})
-            request_id = event.get("requestId")
-            if challenge.get("source") == "Proxy":
-                log.debug("CDP: proxy auth challenge for %s", request_id)
-                await cdp.send(
-                    "Fetch.continueWithAuth",
-                    {
-                        "requestId": request_id,
-                        "authChallengeResponse": {
-                            "response": "ProvideCredentials",
-                            "username": username,
-                            "password": password,
-                        },
-                    },
-                )
-            else:
-                log.debug("CDP: non-proxy auth challenge, cancelling: %s", challenge)
-                await cdp.send(
-                    "Fetch.continueWithAuth",
-                    {
-                        "requestId": request_id,
-                        "authChallengeResponse": {"response": "CancelAuth"},
-                    },
-                )
-
-        async def on_request_paused(event: dict) -> None:
-            request_id = event.get("requestId")
-            await cdp.send("Fetch.continueRequest", {"requestId": request_id})
-
-        cdp.on("Fetch.authRequired", on_auth_required)
-        cdp.on("Fetch.requestPaused", on_request_paused)
-
-        await cdp.send(
-            "Fetch.enable",
-            {
-                "handleAuthRequests": True,
-                "patterns": [{"requestStage": "Response"}],
-            },
-        )
-        log.info("CDP Fetch proxy auth handler installed.")
-
-    def _get_proxy_and_launch_args(self) -> tuple:
+    def _get_proxy_and_launch_args(self) -> tuple[dict[str, str] | None, list[str]]:
         """Extract proxy config and build Chrome launch args.
 
-        Returns (proxy_url, launch_args).  Sets self._proxy_username/password
-        as a side-effect if a proxy is configured.
+        Returns (proxy, launch_args), where proxy is a Playwright launch config
+        dict or None.
         """
         proxy_url = (
             os.environ.get("HTTPS_PROXY")
@@ -245,6 +234,7 @@ class BrowserManager:
             or os.environ.get("http_proxy")
         )
 
+        proxy: dict[str, str] | None = None
         launch_args = [
             "--no-sandbox",
             "--disable-setuid-sandbox",
@@ -252,23 +242,91 @@ class BrowserManager:
             "--disable-gpu",
             "--disable-extensions",
             "--disable-blink-features=AutomationControlled",
+            "--enable-logging=stderr",
         ]
+        if os.environ.get("CHROME_VERBOSE_LOGGING", "0") == "1":
+            launch_args.append("--v=1")
 
         if proxy_url:
             parsed = urlparse(proxy_url)
-            server = f"{parsed.scheme}://{parsed.hostname}"
-            if parsed.port:
-                server += f":{parsed.port}"
-            launch_args.append(f"--proxy-server={server}")
-            self._proxy_username = parsed.username
-            self._proxy_password = parsed.password
-            log.info(
-                "Proxy configured: server=%s, authenticated=%s",
-                server,
-                bool(parsed.username),
-            )
+            if parsed.scheme and parsed.hostname:
+                server = f"{parsed.scheme}://{parsed.hostname}"
+                if parsed.port:
+                    server += f":{parsed.port}"
+                proxy = {"server": server}
+                if parsed.username is not None:
+                    proxy["username"] = unquote(parsed.username)
+                if parsed.password is not None:
+                    proxy["password"] = unquote(parsed.password)
+                log.info(
+                    "Proxy configured: server=%s, authenticated=%s",
+                    server,
+                    bool(parsed.username),
+                )
+            else:
+                log.warning(
+                    "Ignoring invalid proxy URL from environment: %r", proxy_url
+                )
 
-        return proxy_url, launch_args
+        return proxy, launch_args
+
+    def _prepare_chrome_log_file(self) -> None:
+        """Ensure CHROME_LOG_FILE exists and is empty for this launch attempt."""
+        path = self._chrome_log_file
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("")
+        except Exception as exc:
+            log.warning("Failed to prepare Chrome log file %s: %s", path, exc)
+
+    def _log_launch_environment(self) -> None:
+        """Emit environment details that matter for Chrome startup issues."""
+        channel = os.environ.get("PLAYWRIGHT_CHANNEL", "chrome")
+        log.info(
+            "Launch environment: uid=%s gid=%s channel=%s",
+            os.getuid(),
+            os.getgid(),
+            channel,
+        )
+
+        chrome_bins = [
+            "google-chrome",
+            "google-chrome-stable",
+            "chrome",
+            "chrome-browser",
+        ]
+        found = [(name, shutil.which(name)) for name in chrome_bins if shutil.which(name)]
+        if not found:
+            log.warning("No Chrome executable found on PATH.")
+            return
+
+        for name, path in found:
+            try:
+                proc = subprocess.run(
+                    [path, "--version"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                version = (proc.stdout or proc.stderr or "").strip()
+                log.info("Chrome binary: %s (%s) => %s", name, path, version or "unknown")
+            except Exception as exc:
+                log.warning("Failed to read Chrome version for %s (%s): %s", name, path, exc)
+
+    def _log_chrome_stderr_tail(self) -> None:
+        """Log the tail of CHROME_LOG_FILE if present."""
+        path = self._chrome_log_file
+        if not path.exists():
+            return
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+            if not lines:
+                return
+            tail = "\n".join(lines[-40:])
+            log.warning("Chrome log tail from %s:\n%s", path, tail)
+        except Exception as exc:
+            log.warning("Failed to read Chrome log file %s: %s", path, exc)
 
     @property
     def element_map(self) -> dict[int, dict]:
@@ -539,11 +597,11 @@ class BrowserManager:
 
     # ----- cleanup -----------------------------------------------------------
 
-    async def close(self) -> None:
-        log.info("Closing browser...")
+    async def _cleanup_runtime(self) -> None:
+        """Best-effort close of all Playwright resources, resets handles."""
         try:
-            if self._cdp_session:
-                await self._cdp_session.detach()
+            if self._page:
+                await self._page.close()
         except Exception:
             pass
         try:
@@ -561,6 +619,15 @@ class BrowserManager:
                 await self._pw.stop()
         except Exception:
             pass
+
+        self._page = None
+        self._context = None
+        self._browser = None
+        self._pw = None
+
+    async def close(self) -> None:
+        log.info("Closing browser...")
+        await self._cleanup_runtime()
         log.info("Browser closed.")
 
 
@@ -586,7 +653,11 @@ def handle_navigate(args: dict) -> str:
         url = "https://" + url
 
     async def _do():
-        page = await browser_mgr.ensure_page()
+        try:
+            page = await browser_mgr.ensure_page()
+        except Exception as exc:
+            log.exception("Browser startup failed during navigate")
+            return json.dumps({"error": f"Failed to start browser: {exc}"})
         try:
             await page.goto(url, wait_until="domcontentloaded")
         except PlaywrightTimeout:
