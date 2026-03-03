@@ -21,20 +21,13 @@ import grpc
 import capability_pb2
 import capability_pb2_grpc
 
-from playwright.sync_api import (
-    sync_playwright,
-    Browser as SyncBrowser,
-    BrowserContext as SyncBrowserContext,
-    Page as SyncPage,
-    Playwright as SyncPlaywright,
-    TimeoutError as PlaywrightTimeout,
-)
 from playwright.async_api import (
     async_playwright,
     Browser as AsyncBrowser,
     BrowserContext as AsyncBrowserContext,
     Page as AsyncPage,
     Playwright as AsyncPlaywright,
+    TimeoutError as PlaywrightTimeout,
 )
 
 logging.basicConfig(
@@ -44,65 +37,32 @@ logging.basicConfig(
 log = logging.getLogger("web-browser")
 
 # ---------------------------------------------------------------------------
-# Playwright thread — a dedicated thread with NO asyncio event loop.
+# Playwright thread — a dedicated thread running its own asyncio event loop.
 #
-# Recent versions of grpcio create an asyncio event loop on the main thread
-# (and gRPC worker threads inherit it).  Playwright's sync_playwright()
-# cannot start inside an existing asyncio loop.  We solve this by running
-# ALL Playwright/browser work on a single dedicated thread whose asyncio
-# event loop has been explicitly removed.
+# All Playwright operations run as coroutines on this loop.  External threads
+# (gRPC workers) submit work via run_in_pw_thread() which uses
+# asyncio.run_coroutine_threadsafe().
 #
-# Callers use run_in_pw_thread(fn) to execute a callable on this thread and
-# block until it returns.
+# This avoids the fundamental conflict between grpcio (which may install a
+# C-level asyncio running-loop that leaks into worker threads) and
+# Playwright's sync API (which refuses to start when *any* running loop is
+# detected).  By owning the event loop ourselves and using the async
+# Playwright API exclusively, there is no conflict.
 # ---------------------------------------------------------------------------
 
-_pw_queue: list[tuple[Callable, threading.Event, list]] = []
-_pw_queue_lock = threading.Lock()
-_pw_queue_ready = threading.Event()
+_pw_loop: asyncio.AbstractEventLoop | None = None
 _pw_thread_started = threading.Event()
 
 
 def _pw_thread_main() -> None:
     """Entry point for the Playwright worker thread."""
-    # Guarantee this thread has NO asyncio event loop.
-    #
-    # Playwright's sync_playwright() checks asyncio.get_running_loop() and
-    # refuses to start if one exists.  Various libraries (grpcio, uvloop,
-    # container init systems) may install or run an event loop on the main
-    # thread which can leak into child threads depending on the event loop
-    # policy.
-    #
-    # We install a fresh DefaultEventLoopPolicy so this thread's state is
-    # completely independent, then explicitly clear any event loop.
-    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-    asyncio.set_event_loop(None)
-
-    # Double-check: ensure no running loop is visible to this thread.
-    try:
-        asyncio.get_running_loop()
-        # If we get here, something very unusual is happening.
-        log.warning("Playwright thread still sees a running asyncio loop!")
-    except RuntimeError:
-        pass  # Expected — no running loop.
-
+    global _pw_loop
+    _pw_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_pw_loop)
     _pw_thread_started.set()
-    log.info("Playwright worker thread started.")
-
-    while True:
-        _pw_queue_ready.wait()
-        _pw_queue_ready.clear()
-
-        while True:
-            with _pw_queue_lock:
-                if not _pw_queue:
-                    break
-                fn, done_event, result_box = _pw_queue.pop(0)
-
-            try:
-                result_box.append(("ok", fn()))
-            except Exception as exc:
-                result_box.append(("err", exc))
-            done_event.set()
+    log.info("Playwright worker thread started (asyncio event loop).")
+    _pw_loop.run_forever()
+    log.info("Playwright worker thread exiting.")
 
 
 _pw_thread = threading.Thread(target=_pw_thread_main, daemon=True)
@@ -113,22 +73,20 @@ _pw_thread_started.wait()
 def run_in_pw_thread(fn: Callable) -> Any:
     """Execute *fn* on the Playwright thread and return its result.
 
-    Blocks the calling thread until *fn* completes.  If *fn* raises,
-    the exception is re-raised in the caller.
+    *fn* may be an async function, a coroutine, or a plain callable.
+    Blocks the calling thread until completion.  If *fn* raises, the
+    exception is re-raised in the caller.
     """
-    done = threading.Event()
-    result_box: list = []
-
-    with _pw_queue_lock:
-        _pw_queue.append((fn, done, result_box))
-    _pw_queue_ready.set()
-
-    done.wait()
-
-    status, value = result_box[0]
-    if status == "err":
-        raise value
-    return value
+    if asyncio.iscoroutinefunction(fn):
+        coro = fn()
+    elif asyncio.iscoroutine(fn):
+        coro = fn
+    else:
+        async def _wrap():
+            return fn()
+        coro = _wrap()
+    future = asyncio.run_coroutine_threadsafe(coro, _pw_loop)
+    return future.result()
 
 
 # ---------------------------------------------------------------------------
@@ -166,62 +124,34 @@ class SessionState:
 class BrowserManager:
     """Manages a single Playwright browser instance and page.
 
-    All methods MUST be called from the Playwright worker thread
-    (via run_in_pw_thread).
+    All async methods run on the Playwright worker thread's event loop
+    (submitted via run_in_pw_thread).
     """
 
     def __init__(self) -> None:
-        self._pw: SyncPlaywright | AsyncPlaywright | None = None
-        self._browser: SyncBrowser | AsyncBrowser | None = None
-        self._context: SyncBrowserContext | AsyncBrowserContext | None = None
-        self._page: SyncPage | AsyncPage | None = None
+        self._pw: AsyncPlaywright | None = None
+        self._browser: AsyncBrowser | None = None
+        self._context: AsyncBrowserContext | None = None
+        self._page: AsyncPage | None = None
         self._cdp_session = None
         self._proxy_username: str | None = None
         self._proxy_password: str | None = None
         self._element_map: dict[int, dict] = {}
-        self._async_mode: bool = False
-        self._async_loop: asyncio.AbstractEventLoop | None = None
 
-    def _ensure_browser(self) -> SyncPage | AsyncPage:
+    async def ensure_page(self) -> AsyncPage:
         """Lazily start the browser on first use."""
         if self._page is not None:
             return self._page
 
         log.info("Starting Playwright and launching Chrome...")
-
-        # Try the sync API first.  If an asyncio event loop is running on
-        # this thread (e.g. injected by grpcio, uvloop, or the container
-        # runtime), sync_playwright() will raise.  In that case, fall back
-        # to the async API driven by a private event loop.
-        try:
-            self._pw = sync_playwright().start()
-            log.info("Using Playwright Sync API.")
-        except Exception as sync_err:
-            if "Sync API inside the asyncio loop" in str(sync_err):
-                log.warning(
-                    "sync_playwright() blocked by asyncio loop; "
-                    "falling back to async API: %s", sync_err,
-                )
-                self._async_mode = True
-                self._async_loop = asyncio.new_event_loop()
-                # Run the entire async setup in one shot so the event loop
-                # is running for all Playwright async operations (including
-                # event subscriptions like page.on()).
-                self._async_loop.run_until_complete(self._async_setup())
-                log.info("Browser ready (async mode).")
-                return self._page
-            else:
-                raise
-
-        # ----- Sync path: same setup as the original code --------------------
-        self._launch_browser()
+        await self._setup()
         log.info("Browser ready.")
         return self._page
 
-    async def _async_setup(self) -> None:
+    async def _setup(self) -> None:
         """Full browser setup using the async Playwright API."""
         self._pw = await async_playwright().start()
-        log.info("Using Playwright Async API (fallback).")
+        log.info("Using Playwright Async API.")
 
         proxy_url, launch_args = self._get_proxy_and_launch_args()
 
@@ -250,10 +180,10 @@ class BrowserManager:
         self._page.on("dialog", _dismiss)
 
         if self._proxy_username:
-            await self._async_setup_cdp_proxy_auth(self._page)
+            await self._setup_cdp_proxy_auth(self._page)
 
-    async def _async_setup_cdp_proxy_auth(self, page) -> None:
-        """Async version of CDP proxy auth setup."""
+    async def _setup_cdp_proxy_auth(self, page) -> None:
+        """Set up CDP Fetch domain to handle proxy 407 auth challenges."""
         cdp = await page.context.new_cdp_session(page)
         self._cdp_session = cdp
 
@@ -340,123 +270,21 @@ class BrowserManager:
 
         return proxy_url, launch_args
 
-    def _launch_browser(self) -> None:
-        """Sync browser setup (shared between sync init path)."""
-        proxy_url, launch_args = self._get_proxy_and_launch_args()
-
-        self._browser = self._pw.chromium.launch(
-            headless=True,
-            channel="chrome",
-            args=launch_args,
-        )
-
-        self._context = self._browser.new_context(
-            viewport={"width": 1280, "height": 960},
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-            ),
-            ignore_https_errors=True,
-        )
-
-        self._context.set_default_timeout(30_000)
-        self._context.set_default_navigation_timeout(30_000)
-
-        self._page = self._context.new_page()
-
-        self._page.on("dialog", lambda d: d.dismiss())
-
-        if self._proxy_username:
-            self._setup_cdp_proxy_auth(self._page)
-
-    def _maybe_await(self, obj):
-        """If in async mode, run a coroutine on the private event loop.
-
-        In sync mode, *obj* is already a concrete value (Playwright sync API
-        returns plain objects), so just return it.  In async mode, *obj* is a
-        coroutine that must be awaited.
-        """
-        if self._async_mode and asyncio.iscoroutine(obj):
-            return self._async_loop.run_until_complete(obj)
-        return obj
-
-    def _setup_cdp_proxy_auth(self, page) -> None:
-        """Set up CDP Fetch domain to handle proxy 407 auth challenges.
-
-        Instead of relying on Playwright's proxy={username, password} (which
-        causes Chromium to hang on certain sites like google.com), we use the
-        CDP Fetch domain to intercept 407 challenges and respond with
-        credentials programmatically.
-        """
-        cdp = self._maybe_await(page.context.new_cdp_session(page))
-        self._cdp_session = cdp
-
-        username = self._proxy_username
-        password = self._proxy_password
-        maybe_await = self._maybe_await
-
-        def on_auth_required(event: dict) -> None:
-            challenge = event.get("authChallenge", {})
-            request_id = event.get("requestId")
-            if challenge.get("source") == "Proxy":
-                log.debug("CDP: proxy auth challenge for %s", request_id)
-                maybe_await(cdp.send(
-                    "Fetch.continueWithAuth",
-                    {
-                        "requestId": request_id,
-                        "authChallengeResponse": {
-                            "response": "ProvideCredentials",
-                            "username": username,
-                            "password": password,
-                        },
-                    },
-                ))
-            else:
-                # Not a proxy challenge — cancel so the browser handles it
-                log.debug("CDP: non-proxy auth challenge, cancelling: %s", challenge)
-                maybe_await(cdp.send(
-                    "Fetch.continueWithAuth",
-                    {
-                        "requestId": request_id,
-                        "authChallengeResponse": {"response": "CancelAuth"},
-                    },
-                ))
-
-        def on_request_paused(event: dict) -> None:
-            request_id = event.get("requestId")
-            maybe_await(cdp.send("Fetch.continueRequest", {"requestId": request_id}))
-
-        cdp.on("Fetch.authRequired", on_auth_required)
-        cdp.on("Fetch.requestPaused", on_request_paused)
-
-        self._maybe_await(cdp.send(
-            "Fetch.enable",
-            {
-                "handleAuthRequests": True,
-                "patterns": [{"requestStage": "Response"}],
-            },
-        ))
-        log.info("CDP Fetch proxy auth handler installed.")
-
-    @property
-    def page(self):
-        return self._ensure_browser()
-
     @property
     def element_map(self) -> dict[int, dict]:
         return self._element_map
 
     # ----- snapshot ----------------------------------------------------------
 
-    def take_snapshot(self, max_text_length: int = 5000) -> str:
+    async def take_snapshot(self, max_text_length: int = 5000) -> str:
         """Build a text representation of the current page state."""
-        page = self.page
+        page = await self.ensure_page()
 
         url = page.url
-        title = self._maybe_await(page.title())
+        title = await page.title()
 
         # Collect interactive elements
-        elements = self._collect_interactive_elements()
+        elements = await self._collect_interactive_elements()
         self._element_map = {e["index"]: e for e in elements}
 
         lines: list[str] = []
@@ -475,7 +303,7 @@ class BrowserManager:
         lines.append("=== Page Text ===")
 
         try:
-            text = self._maybe_await(page.inner_text("body")) or ""
+            text = await page.inner_text("body") or ""
         except Exception:
             text = ""
 
@@ -499,9 +327,9 @@ class BrowserManager:
 
         return "\n".join(lines)
 
-    def _collect_interactive_elements(self) -> list[dict]:
+    async def _collect_interactive_elements(self) -> list[dict]:
         """Query the DOM for interactive elements and return structured info."""
-        page = self.page
+        page = await self.ensure_page()
 
         # JavaScript that runs in the browser to enumerate interactive elements.
         # Returns a JSON-serialisable list.
@@ -587,7 +415,7 @@ class BrowserManager:
         """
 
         try:
-            raw = self._maybe_await(page.evaluate(js))
+            raw = await page.evaluate(js)
         except Exception as exc:
             log.warning("Failed to collect interactive elements: %s", exc)
             return []
@@ -667,11 +495,11 @@ class BrowserManager:
 
     # ----- element resolution -----------------------------------------------
 
-    def resolve_element(self, element_index: int | None = None,
-                        selector: str | None = None,
-                        text: str | None = None) -> Any:
+    async def resolve_element(self, element_index: int | None = None,
+                              selector: str | None = None,
+                              text: str | None = None) -> Any:
         """Resolve an element from index, selector, or text match."""
-        page = self.page
+        page = await self.ensure_page()
 
         if element_index is not None:
             el_info = self._element_map.get(element_index)
@@ -700,7 +528,7 @@ class BrowserManager:
             # Try common patterns: links, buttons, then any visible text
             for role in ["link", "button"]:
                 loc = page.get_by_role(role, name=text)
-                if self._maybe_await(loc.count()) > 0:
+                if await loc.count() > 0:
                     return loc.first
             # Fall back to text match
             return page.get_by_text(text, exact=False).first
@@ -711,45 +539,41 @@ class BrowserManager:
 
     # ----- cleanup -----------------------------------------------------------
 
-    def close(self) -> None:
+    async def close(self) -> None:
         log.info("Closing browser...")
         try:
             if self._cdp_session:
-                self._maybe_await(self._cdp_session.detach())
+                await self._cdp_session.detach()
         except Exception:
             pass
         try:
             if self._context:
-                self._maybe_await(self._context.close())
+                await self._context.close()
         except Exception:
             pass
         try:
             if self._browser:
-                self._maybe_await(self._browser.close())
+                await self._browser.close()
         except Exception:
             pass
         try:
             if self._pw:
-                self._maybe_await(self._pw.stop())
+                await self._pw.stop()
         except Exception:
             pass
-        if self._async_loop:
-            self._async_loop.close()
         log.info("Browser closed.")
 
 
 # ---------------------------------------------------------------------------
 # Tool handlers
 #
-# Each handler is a plain synchronous function.  Playwright calls are
-# dispatched to the dedicated Playwright thread via run_in_pw_thread().
+# Each handler is a plain synchronous function that returns a JSON string.
+# Playwright calls are dispatched to the dedicated Playwright thread as
+# async closures via run_in_pw_thread().
 # ---------------------------------------------------------------------------
 
 browser_mgr = BrowserManager()
 session_state = SessionState()
-
-# Shorthand for browser_mgr._maybe_await — keeps handler code concise.
-_ma = browser_mgr._maybe_await
 
 
 def handle_navigate(args: dict) -> str:
@@ -761,14 +585,14 @@ def handle_navigate(args: dict) -> str:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    def _do():
-        page = browser_mgr.page
+    async def _do():
+        page = await browser_mgr.ensure_page()
         try:
-            _ma(page.goto(url, wait_until="domcontentloaded"))
+            await page.goto(url, wait_until="domcontentloaded")
         except PlaywrightTimeout:
             return json.dumps({
                 "error": f"Timed out loading {url}. The page may still be loading.",
-                "partial_snapshot": browser_mgr.take_snapshot(max_text_length=2000),
+                "partial_snapshot": await browser_mgr.take_snapshot(max_text_length=2000),
             })
         except Exception as exc:
             log.warning("Navigation to %s failed: %s", url, exc)
@@ -776,7 +600,7 @@ def handle_navigate(args: dict) -> str:
 
         return json.dumps({
             "status": "ok",
-            "snapshot": browser_mgr.take_snapshot(),
+            "snapshot": await browser_mgr.take_snapshot(),
         })
 
     return run_in_pw_thread(_do)
@@ -785,18 +609,18 @@ def handle_navigate(args: dict) -> str:
 def handle_get_page_snapshot(args: dict) -> str:
     max_len = args.get("max_text_length", 5000)
 
-    def _do():
+    async def _do():
         return json.dumps({
-            "snapshot": browser_mgr.take_snapshot(max_text_length=max_len),
+            "snapshot": await browser_mgr.take_snapshot(max_text_length=max_len),
         })
 
     return run_in_pw_thread(_do)
 
 
 def handle_click(args: dict) -> str:
-    def _do():
+    async def _do():
         try:
-            locator = browser_mgr.resolve_element(
+            locator = await browser_mgr.resolve_element(
                 element_index=args.get("element_index"),
                 selector=args.get("selector"),
                 text=args.get("text"),
@@ -805,20 +629,21 @@ def handle_click(args: dict) -> str:
             return json.dumps({"error": str(exc)})
 
         try:
-            _ma(locator.click(timeout=10_000))
+            await locator.click(timeout=10_000)
             # Wait briefly for potential navigation or DOM changes
-            _ma(browser_mgr.page.wait_for_load_state("domcontentloaded", timeout=5_000))
+            page = await browser_mgr.ensure_page()
+            await page.wait_for_load_state("domcontentloaded", timeout=5_000)
         except PlaywrightTimeout:
             pass  # Page may not navigate — that's fine
         except Exception as exc:
             return json.dumps({
                 "error": f"Click failed: {exc}",
-                "snapshot": browser_mgr.take_snapshot(max_text_length=2000),
+                "snapshot": await browser_mgr.take_snapshot(max_text_length=2000),
             })
 
         return json.dumps({
             "status": "ok",
-            "snapshot": browser_mgr.take_snapshot(),
+            "snapshot": await browser_mgr.take_snapshot(),
         })
 
     return run_in_pw_thread(_do)
@@ -831,9 +656,9 @@ def handle_fill(args: dict) -> str:
 
     clear_first = args.get("clear_first", True)
 
-    def _do():
+    async def _do():
         try:
-            locator = browser_mgr.resolve_element(
+            locator = await browser_mgr.resolve_element(
                 element_index=args.get("element_index"),
                 selector=args.get("selector"),
             )
@@ -842,9 +667,9 @@ def handle_fill(args: dict) -> str:
 
         try:
             if clear_first:
-                _ma(locator.fill(value, timeout=10_000))
+                await locator.fill(value, timeout=10_000)
             else:
-                _ma(locator.press_sequentially(value, delay=50, timeout=10_000))
+                await locator.press_sequentially(value, delay=50, timeout=10_000)
         except Exception as exc:
             return json.dumps({"error": f"Fill failed: {exc}"})
 
@@ -857,9 +682,9 @@ def handle_fill(args: dict) -> str:
 
 
 def handle_select_option(args: dict) -> str:
-    def _do():
+    async def _do():
         try:
-            locator = browser_mgr.resolve_element(
+            locator = await browser_mgr.resolve_element(
                 element_index=args.get("element_index"),
                 selector=args.get("selector"),
             )
@@ -871,9 +696,9 @@ def handle_select_option(args: dict) -> str:
 
         try:
             if label:
-                _ma(locator.select_option(label=label, timeout=10_000))
+                await locator.select_option(label=label, timeout=10_000)
             elif value:
-                _ma(locator.select_option(value=value, timeout=10_000))
+                await locator.select_option(value=value, timeout=10_000)
             else:
                 return json.dumps({"error": "Provide either 'value' or 'label'."})
         except Exception as exc:
@@ -889,27 +714,27 @@ def handle_press_key(args: dict) -> str:
     if not key:
         return json.dumps({"error": "key is required"})
 
-    def _do():
-        page = browser_mgr.page
+    async def _do():
+        page = await browser_mgr.ensure_page()
 
         # Optionally focus an element first
         el_index = args.get("element_index")
         selector = args.get("selector")
         if el_index is not None or selector is not None:
             try:
-                locator = browser_mgr.resolve_element(
+                locator = await browser_mgr.resolve_element(
                     element_index=el_index,
                     selector=selector,
                 )
-                _ma(locator.focus(timeout=5_000))
+                await locator.focus(timeout=5_000)
             except Exception as exc:
                 return json.dumps({"error": f"Could not focus element: {exc}"})
 
         try:
-            _ma(page.keyboard.press(key))
+            await page.keyboard.press(key)
             # Brief wait for any navigation or DOM update
             try:
-                _ma(page.wait_for_load_state("domcontentloaded", timeout=3_000))
+                await page.wait_for_load_state("domcontentloaded", timeout=3_000)
             except PlaywrightTimeout:
                 pass
         except Exception as exc:
@@ -917,7 +742,7 @@ def handle_press_key(args: dict) -> str:
 
         return json.dumps({
             "status": "ok",
-            "snapshot": browser_mgr.take_snapshot(),
+            "snapshot": await browser_mgr.take_snapshot(),
         })
 
     return run_in_pw_thread(_do)
@@ -927,8 +752,8 @@ def handle_scroll(args: dict) -> str:
     direction = args.get("direction", "down")
     amount = args.get("amount", "page")
 
-    def _do():
-        page = browser_mgr.page
+    async def _do():
+        page = await browser_mgr.ensure_page()
 
         if amount == "page":
             pixels = 960  # match viewport height
@@ -942,24 +767,24 @@ def handle_scroll(args: dict) -> str:
             pixels = -pixels
 
         try:
-            _ma(page.evaluate(f"window.scrollBy(0, {pixels})"))
-            _ma(page.wait_for_timeout(500))  # let lazy-loaded content appear
+            await page.evaluate(f"window.scrollBy(0, {pixels})")
+            await page.wait_for_timeout(500)  # let lazy-loaded content appear
         except Exception as exc:
             return json.dumps({"error": f"Scroll failed: {exc}"})
 
         return json.dumps({
             "status": "ok",
-            "snapshot": browser_mgr.take_snapshot(),
+            "snapshot": await browser_mgr.take_snapshot(),
         })
 
     return run_in_pw_thread(_do)
 
 
 def handle_go_back(args: dict) -> str:
-    def _do():
-        page = browser_mgr.page
+    async def _do():
+        page = await browser_mgr.ensure_page()
         try:
-            _ma(page.go_back(wait_until="domcontentloaded", timeout=15_000))
+            await page.go_back(wait_until="domcontentloaded", timeout=15_000)
         except PlaywrightTimeout:
             pass
         except Exception as exc:
@@ -967,7 +792,7 @@ def handle_go_back(args: dict) -> str:
 
         return json.dumps({
             "status": "ok",
-            "snapshot": browser_mgr.take_snapshot(),
+            "snapshot": await browser_mgr.take_snapshot(),
         })
 
     return run_in_pw_thread(_do)
@@ -980,11 +805,11 @@ def handle_wait(args: dict) -> str:
 
     timeout_sec = args.get("timeout_seconds", 10)
 
-    def _do():
-        page = browser_mgr.page
+    async def _do():
+        page = await browser_mgr.ensure_page()
 
         try:
-            _ma(page.wait_for_selector(selector, timeout=timeout_sec * 1000))
+            await page.wait_for_selector(selector, timeout=timeout_sec * 1000)
             return json.dumps({
                 "status": "found",
                 "selector": selector,
@@ -1005,10 +830,10 @@ def handle_execute_javascript(args: dict) -> str:
     if not script:
         return json.dumps({"error": "script is required"})
 
-    def _do():
-        page = browser_mgr.page
+    async def _do():
+        page = await browser_mgr.ensure_page()
         try:
-            result = _ma(page.evaluate(script))
+            result = await page.evaluate(script)
             return json.dumps({
                 "status": "ok",
                 "result": result,
@@ -1167,6 +992,8 @@ def serve() -> None:
     log.info("Stopping gRPC server...")
     server.stop(grace=5)
     run_in_pw_thread(browser_mgr.close)
+    _pw_loop.call_soon_threadsafe(_pw_loop.stop)
+    _pw_thread.join(timeout=5)
     log.info("Server stopped.")
 
 
