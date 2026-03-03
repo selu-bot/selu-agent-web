@@ -153,12 +153,12 @@ class BrowserManager:
         self._log_launch_environment()
 
         last_exc: Exception | None = None
-        for channel in self._candidate_channels():
-            label = channel
+        for launch in self._candidate_launches():
+            label = launch["label"]
             log.info("Starting Playwright and launching %s...", label)
             self._prepare_chrome_log_file()
             try:
-                await self._setup(channel=channel)
+                await self._setup(launch=launch)
                 log.info("Browser ready (%s).", label)
                 return self._page
             except Exception as exc:
@@ -169,12 +169,52 @@ class BrowserManager:
 
         raise RuntimeError("Unable to start browser context with Chrome.") from last_exc
 
-    def _candidate_channels(self) -> list[str]:
-        """Return launch candidates in order (Chrome-only by default)."""
+    def _candidate_launches(self) -> list[dict[str, str]]:
+        """Return Chrome launch candidates in order."""
         preferred = os.environ.get("PLAYWRIGHT_CHANNEL", "chrome").strip()
-        return [preferred or "chrome"]
+        launches: list[dict[str, str]] = [
+            {
+                "kind": "channel",
+                "value": preferred or "chrome",
+                "label": f"channel:{preferred or 'chrome'}",
+            }
+        ]
 
-    async def _setup(self, channel: str) -> None:
+        seen_execs: set[str] = set()
+        explicit_exec = os.environ.get("PLAYWRIGHT_CHROME_EXECUTABLE", "").strip()
+        for path in [explicit_exec, "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"]:
+            if not path or path in seen_execs:
+                continue
+            seen_execs.add(path)
+            if os.path.exists(path):
+                launches.append(
+                    {
+                        "kind": "executable",
+                        "value": path,
+                        "label": f"executable:{path}",
+                    }
+                )
+
+        return launches
+
+    def _browser_env(self, proxy_configured: bool) -> dict[str, str]:
+        env = dict(os.environ)
+        env["CHROME_LOG_FILE"] = str(self._chrome_log_file)
+        if proxy_configured:
+            for key in (
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "NO_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+                "no_proxy",
+            ):
+                env.pop(key, None)
+        return env
+
+    async def _setup(self, launch: dict[str, str]) -> None:
         """Full browser setup using the async Playwright API."""
         self._pw = await async_playwright().start()
         log.info("Using Playwright Async API.")
@@ -183,20 +223,19 @@ class BrowserManager:
         launch_options: dict[str, Any] = {
             "headless": True,
             "args": launch_args,
-            "env": {
-                **os.environ,
-                "CHROME_LOG_FILE": str(self._chrome_log_file),
-            },
+            "env": self._browser_env(proxy_configured=bool(proxy)),
         }
-        if channel:
-            launch_options["channel"] = channel
+        if launch["kind"] == "channel":
+            launch_options["channel"] = launch["value"]
+        else:
+            launch_options["executable_path"] = launch["value"]
         if proxy:
             launch_options["proxy"] = proxy
 
         self._browser = await self._pw.chromium.launch(**launch_options)
         if not self._browser.is_connected():
             raise RuntimeError(
-                f"Browser disconnected immediately after launch (channel={channel!r})."
+                f"Browser disconnected immediately after launch ({launch['label']})."
             )
         self._browser.on(
             "disconnected",
@@ -242,7 +281,14 @@ class BrowserManager:
             "--disable-gpu",
             "--disable-extensions",
             "--disable-blink-features=AutomationControlled",
-            "--enable-logging=stderr",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-domain-reliability",
+            "--disable-quic",
+            "--enable-logging",
+            f"--log-file={self._chrome_log_file}",
         ]
         if os.environ.get("CHROME_VERBOSE_LOGGING", "0") == "1":
             launch_args.append("--v=1")
