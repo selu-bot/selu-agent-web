@@ -267,7 +267,7 @@ credentials:
     required: false
 
 resources:
-  max_memory_mb: 1024
-  max_cpu_fraction: 1.0
+  max_memory_mb: 2048
+  max_cpu_fraction: 2.0
   max_cpu_seconds: 300
   pids_limit: 256

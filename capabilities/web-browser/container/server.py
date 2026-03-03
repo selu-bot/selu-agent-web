@@ -16,6 +16,7 @@ import signal
 import shutil
 import subprocess
 import threading
+import time
 from concurrent import futures
 from pathlib import Path
 from typing import Any, Callable
@@ -35,6 +36,7 @@ from playwright.async_api import (
     Playwright as AsyncPlaywright,
     TimeoutError as PlaywrightTimeout,
 )
+from playwright._impl._errors import TargetClosedError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -155,6 +157,9 @@ class BrowserManager:
         # Per-thread state: each thread gets its own page and element map
         self._pages: dict[str, AsyncPage] = {}
         self._element_maps: dict[str, dict[int, dict]] = {}
+        # Diagnostics: track when the browser was started and when it disconnected
+        self._browser_started_at: float | None = None
+        self._disconnect_reason: str | None = None
         self._browser_log_file = Path(
             os.environ.get("BROWSER_LOG_FILE", "/tmp/browser-debug.log")
         )
@@ -180,6 +185,9 @@ class BrowserManager:
 
         On first call, starts the browser context. Subsequent calls for the
         same thread reuse the existing page. Different threads get separate tabs.
+
+        If the browser context has died (TargetClosedError), tears everything
+        down and restarts once before propagating the error.
         """
         tid = thread_id or self._DEFAULT_THREAD
 
@@ -203,7 +211,25 @@ class BrowserManager:
             page = self._initial_page
             self._initial_page = None
         else:
-            page = await self._context.new_page()
+            try:
+                page = await self._context.new_page()
+            except (TargetClosedError, Exception) as exc:
+                if not isinstance(exc, TargetClosedError) and "Target closed" not in str(exc):
+                    raise
+                # The browser/context died. Tear down and restart once.
+                log.warning(
+                    "Browser context is dead (TargetClosedError on new_page); "
+                    "restarting browser."
+                )
+                if not self._disconnect_reason:
+                    self._diagnose_disconnect()
+                await self._cleanup_runtime()
+                await self._ensure_context()
+                if hasattr(self, '_initial_page') and self._initial_page is not None:
+                    page = self._initial_page
+                    self._initial_page = None
+                else:
+                    page = await self._context.new_page()
 
         async def _dismiss(d):
             await d.dismiss()
@@ -214,10 +240,29 @@ class BrowserManager:
         log.info("Created new page for thread %s (total pages: %d).", tid, len(self._pages))
         return page
 
+    def _is_context_alive(self) -> bool:
+        """Return True if the browser context appears healthy."""
+        if self._context is None:
+            return False
+        # If we have a browser handle, check its connection status.
+        if self._browser is not None and not self._browser.is_connected():
+            return False
+        return True
+
     async def _ensure_context(self) -> None:
-        """Start the browser context if not already running."""
+        """Start the browser context if not already running.
+
+        If the context exists but the underlying browser has disconnected,
+        tears it down first and starts fresh.
+        """
         if self._context is not None:
-            return
+            if self._is_context_alive():
+                return
+            log.warning("Browser context is stale (disconnected); restarting.")
+            if not self._disconnect_reason:
+                # Disconnect handler may not have fired yet; run diagnostics now.
+                self._diagnose_disconnect()
+            await self._cleanup_runtime()
 
         self._prepare_browser_runtime_dirs()
         self._log_launch_environment()
@@ -309,6 +354,8 @@ class BrowserManager:
             **launch_options,
         )
         self._browser = self._context.browser
+        self._browser_started_at = time.monotonic()
+        self._disconnect_reason = None
         if self._browser is not None:
             if not self._browser.is_connected():
                 raise RuntimeError(
@@ -316,7 +363,7 @@ class BrowserManager:
                 )
             self._browser.on(
                 "disconnected",
-                lambda: log.warning("Browser process disconnected."),
+                self._on_browser_disconnected,
             )
         else:
             log.warning("Persistent context did not expose browser handle.")
@@ -468,6 +515,136 @@ class BrowserManager:
             log.warning("Browser log tail from %s:\n%s", path, tail)
         except Exception as exc:
             log.warning("Failed to read browser log file %s: %s", path, exc)
+
+    def _diagnose_disconnect(self) -> str:
+        """Collect diagnostic information after a browser disconnect.
+
+        Returns a human-readable summary string that is also logged at ERROR
+        level.  The checks are best-effort; failures in any single check are
+        swallowed so diagnostics never themselves cause a crash.
+        """
+        parts: list[str] = ["Browser disconnect diagnostics:"]
+
+        # 1. Uptime — how long was the browser alive?
+        if self._browser_started_at is not None:
+            uptime = time.monotonic() - self._browser_started_at
+            parts.append(f"  Browser uptime before disconnect: {uptime:.1f}s")
+
+        # 2. Disk space
+        try:
+            tmp_usage = shutil.disk_usage(self._browser_tmp_dir)
+            root_usage = shutil.disk_usage("/")
+            parts.append(
+                f"  Disk: tmp_dir={self._browser_tmp_dir} "
+                f"free={tmp_usage.free // (1024 * 1024)}MB "
+                f"total={tmp_usage.total // (1024 * 1024)}MB | "
+                f"root free={root_usage.free // (1024 * 1024)}MB"
+            )
+            if tmp_usage.free < 50 * 1024 * 1024:
+                parts.append("  ** LOW DISK SPACE on tmp_dir — likely cause of crash **")
+            if root_usage.free < 50 * 1024 * 1024:
+                parts.append("  ** LOW DISK SPACE on root — likely cause of crash **")
+        except Exception as exc:
+            parts.append(f"  Disk usage check failed: {exc}")
+
+        # 3. OOM killer — check dmesg / kernel log for recent OOM events
+        try:
+            result = subprocess.run(
+                ["dmesg", "--time-format", "reltime", "-l", "err,crit,alert,emerg"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout:
+                # Look for OOM or kill lines
+                oom_lines = [
+                    line for line in result.stdout.splitlines()
+                    if any(kw in line.lower() for kw in ("oom", "killed process", "out of memory"))
+                ]
+                if oom_lines:
+                    parts.append("  ** OOM killer activity detected in dmesg: **")
+                    for line in oom_lines[-5:]:
+                        parts.append(f"    {line.strip()}")
+                else:
+                    parts.append("  No OOM killer activity in dmesg.")
+            else:
+                # dmesg may not be available (no permissions) — try cgroup OOM events
+                parts.append("  dmesg not available or empty (may lack permissions).")
+        except FileNotFoundError:
+            parts.append("  dmesg not found (not available in this container).")
+        except Exception as exc:
+            parts.append(f"  dmesg check failed: {exc}")
+
+        # 4. cgroup memory stats (common in containers)
+        for cgroup_path in (
+            Path("/sys/fs/cgroup/memory.current"),       # cgroup v2
+            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),  # cgroup v1
+        ):
+            try:
+                if cgroup_path.exists():
+                    mem_bytes = int(cgroup_path.read_text().strip())
+                    mem_mb = mem_bytes // (1024 * 1024)
+                    parts.append(f"  cgroup memory usage: {mem_mb}MB ({cgroup_path})")
+                    break
+            except Exception:
+                pass
+        for limit_path in (
+            Path("/sys/fs/cgroup/memory.max"),            # cgroup v2
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),  # cgroup v1
+        ):
+            try:
+                if limit_path.exists():
+                    raw = limit_path.read_text().strip()
+                    if raw != "max" and raw != "9223372036854771712":
+                        limit_mb = int(raw) // (1024 * 1024)
+                        parts.append(f"  cgroup memory limit: {limit_mb}MB ({limit_path})")
+                    else:
+                        parts.append(f"  cgroup memory limit: unlimited ({limit_path})")
+                    break
+            except Exception:
+                pass
+        # cgroup OOM events counter
+        for events_path in (
+            Path("/sys/fs/cgroup/memory.events"),         # cgroup v2
+        ):
+            try:
+                if events_path.exists():
+                    for line in events_path.read_text().splitlines():
+                        if line.startswith("oom") or line.startswith("oom_kill"):
+                            parts.append(f"  cgroup {line.strip()}")
+                    break
+            except Exception:
+                pass
+
+        # 5. Browser stderr log
+        if self._browser_log_file.exists():
+            try:
+                lines = self._browser_log_file.read_text(errors="replace").splitlines()
+                if lines:
+                    tail = lines[-20:]
+                    parts.append(f"  Browser stderr (last {len(tail)} lines):")
+                    for line in tail:
+                        parts.append(f"    {line}")
+                else:
+                    parts.append("  Browser stderr log is empty.")
+            except Exception as exc:
+                parts.append(f"  Failed to read browser stderr: {exc}")
+        else:
+            parts.append(f"  Browser stderr log not found at {self._browser_log_file}")
+
+        summary = "\n".join(parts)
+        log.error(summary)
+        return summary
+
+    def _on_browser_disconnected(self) -> None:
+        """Event handler for the Playwright browser 'disconnected' event.
+
+        Logs diagnostics to help identify the root cause of the disconnect.
+        """
+        log.error(
+            "Browser process disconnected unexpectedly (uptime: %.1fs).",
+            (time.monotonic() - self._browser_started_at)
+            if self._browser_started_at else -1,
+        )
+        self._disconnect_reason = self._diagnose_disconnect()
 
     @property
     def element_map(self) -> dict[int, dict]:
@@ -949,7 +1126,11 @@ def handle_press_key(args: dict, thread_id: str) -> str:
         return json.dumps({"error": "key is required"})
 
     async def _do():
-        page = await browser_mgr.ensure_page(thread_id)
+        try:
+            page = await browser_mgr.ensure_page(thread_id)
+        except Exception as exc:
+            log.exception("Browser startup failed during press_key")
+            return json.dumps({"error": f"Failed to start browser: {exc}"})
 
         # Optionally focus an element first
         el_index = args.get("element_index")
@@ -988,7 +1169,11 @@ def handle_scroll(args: dict, thread_id: str) -> str:
     amount = args.get("amount", "page")
 
     async def _do():
-        page = await browser_mgr.ensure_page(thread_id)
+        try:
+            page = await browser_mgr.ensure_page(thread_id)
+        except Exception as exc:
+            log.exception("Browser startup failed during scroll")
+            return json.dumps({"error": f"Failed to start browser: {exc}"})
 
         if amount == "page":
             pixels = 960  # match viewport height
@@ -1017,7 +1202,11 @@ def handle_scroll(args: dict, thread_id: str) -> str:
 
 def handle_go_back(args: dict, thread_id: str) -> str:
     async def _do():
-        page = await browser_mgr.ensure_page(thread_id)
+        try:
+            page = await browser_mgr.ensure_page(thread_id)
+        except Exception as exc:
+            log.exception("Browser startup failed during go_back")
+            return json.dumps({"error": f"Failed to start browser: {exc}"})
         try:
             await page.go_back(wait_until="domcontentloaded", timeout=15_000)
         except PlaywrightTimeout:
@@ -1041,7 +1230,11 @@ def handle_wait(args: dict, thread_id: str) -> str:
     timeout_sec = args.get("timeout_seconds", 10)
 
     async def _do():
-        page = await browser_mgr.ensure_page(thread_id)
+        try:
+            page = await browser_mgr.ensure_page(thread_id)
+        except Exception as exc:
+            log.exception("Browser startup failed during wait")
+            return json.dumps({"error": f"Failed to start browser: {exc}"})
 
         try:
             await page.wait_for_selector(selector, timeout=timeout_sec * 1000)
@@ -1066,7 +1259,11 @@ def handle_execute_javascript(args: dict, thread_id: str) -> str:
         return json.dumps({"error": "script is required"})
 
     async def _do():
-        page = await browser_mgr.ensure_page(thread_id)
+        try:
+            page = await browser_mgr.ensure_page(thread_id)
+        except Exception as exc:
+            log.exception("Browser startup failed during execute_javascript")
+            return json.dumps({"error": f"Failed to start browser: {exc}"})
         try:
             result = await page.evaluate(script)
             return json.dumps({
