@@ -40,6 +40,13 @@ COPY server.py .
 # if so we just use it.
 RUN id -u 1000 2>/dev/null || useradd --uid 1000 --create-home selu
 
+# Writable home for Firefox profile, caches, and runtime state.
+# The orchestrator may mount the root filesystem read-only; the home
+# directory must be writable for Firefox to start.
+ENV HOME=/home/browser
+RUN mkdir -p /home/browser/.browser-runtime && chown -R 1000:1000 /home/browser
+VOLUME /home/browser
+
 # gRPC port
 EXPOSE 50051
 

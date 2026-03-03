@@ -73,12 +73,14 @@ _pw_thread.start()
 _pw_thread_started.wait()
 
 
-def run_in_pw_thread(fn: Callable) -> Any:
+def run_in_pw_thread(fn: Callable, timeout: float = 120) -> Any:
     """Execute *fn* on the Playwright thread and return its result.
 
     *fn* may be an async function, a coroutine, or a plain callable.
-    Blocks the calling thread until completion.  If *fn* raises, the
-    exception is re-raised in the caller.
+    Blocks the calling thread until completion or *timeout* seconds elapse.
+    If *fn* raises, the exception is re-raised in the caller.
+    If the timeout fires, the future is cancelled and a TimeoutError is raised
+    so the gRPC worker thread is freed.
     """
     if asyncio.iscoroutinefunction(fn):
         coro = fn()
@@ -89,7 +91,13 @@ def run_in_pw_thread(fn: Callable) -> Any:
             return fn()
         coro = _wrap()
     future = asyncio.run_coroutine_threadsafe(coro, _pw_loop)
-    return future.result()
+    try:
+        return future.result(timeout=timeout)
+    except TimeoutError:
+        future.cancel()
+        raise TimeoutError(
+            f"Playwright operation timed out after {timeout}s"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -122,70 +130,112 @@ class SessionState:
 
 # ---------------------------------------------------------------------------
 # Browser manager — lazy-initialised, one browser per container
+# Multiple threads share the browser context but each gets its own page (tab).
 # ---------------------------------------------------------------------------
 
 class BrowserManager:
-    """Manages a single Playwright browser instance and page.
+    """Manages a single Playwright browser instance with per-thread pages.
 
     All async methods run on the Playwright worker thread's event loop
     (submitted via run_in_pw_thread).
+
+    Each conversation thread gets its own browser tab (page) and element map,
+    so multiple threads within the same session don't interfere with each other.
     """
+
+    _DEFAULT_THREAD = "__default__"
 
     def __init__(self) -> None:
         self._pw: AsyncPlaywright | None = None
         self._browser: AsyncBrowser | None = None
         self._context: AsyncBrowserContext | None = None
-        self._page: AsyncPage | None = None
-        self._element_map: dict[int, dict] = {}
-        self._chrome_log_file = Path(
-            os.environ.get("CHROME_LOG_FILE", "/tmp/chrome-debug.log")
+        # Per-thread state: each thread gets its own page and element map
+        self._pages: dict[str, AsyncPage] = {}
+        self._element_maps: dict[str, dict[int, dict]] = {}
+        self._browser_log_file = Path(
+            os.environ.get("BROWSER_LOG_FILE", "/tmp/browser-debug.log")
         )
         home_dir = Path(os.environ.get("HOME", "/tmp"))
         state_root = Path(
-            os.environ.get("CHROME_STATE_DIR", str(home_dir / ".chrome-runtime"))
+            os.environ.get("BROWSER_STATE_DIR", str(home_dir / ".browser-runtime"))
         )
-        self._chrome_tmp_dir = Path(
-            os.environ.get("CHROME_TMP_DIR", str(state_root / "tmp"))
+        self._browser_tmp_dir = Path(
+            os.environ.get("BROWSER_TMP_DIR", str(state_root / "tmp"))
         )
-        self._chrome_user_data_dir = Path(
-            os.environ.get("CHROME_USER_DATA_DIR", str(state_root / "user-data"))
+        self._browser_user_data_dir = Path(
+            os.environ.get("BROWSER_USER_DATA_DIR", str(state_root / "user-data"))
         )
-        self._chrome_runtime_dir = Path(
-            os.environ.get("CHROME_RUNTIME_DIR", str(state_root / "xdg-runtime"))
+        self._browser_runtime_dir = Path(
+            os.environ.get("BROWSER_RUNTIME_DIR", str(state_root / "xdg-runtime"))
         )
-        self._chrome_crash_dir = Path(
-            os.environ.get("CHROME_CRASH_DIR", str(state_root / "crash"))
+        self._browser_crash_dir = Path(
+            os.environ.get("BROWSER_CRASH_DIR", str(state_root / "crash"))
         )
 
-    async def ensure_page(self) -> AsyncPage:
-        """Lazily start the browser on first use."""
-        if self._page is not None and not self._page.is_closed():
-            return self._page
+    async def ensure_page(self, thread_id: str | None = None) -> AsyncPage:
+        """Return the page for the given thread, creating one if needed.
 
-        if self._page is not None and self._page.is_closed():
-            log.warning("Existing page is closed; resetting browser runtime.")
-            await self._cleanup_runtime()
+        On first call, starts the browser context. Subsequent calls for the
+        same thread reuse the existing page. Different threads get separate tabs.
+        """
+        tid = thread_id or self._DEFAULT_THREAD
 
-        self._prepare_chrome_runtime_dirs()
+        # Fast path: page already exists and is open
+        page = self._pages.get(tid)
+        if page is not None and not page.is_closed():
+            return page
+
+        # If a page existed but was closed, clean it up
+        if page is not None:
+            log.warning("Page for thread %s was closed; creating a new one.", tid)
+            self._pages.pop(tid, None)
+            self._element_maps.pop(tid, None)
+
+        # Ensure the browser context is running
+        await self._ensure_context()
+
+        # Reuse the initial page from the persistent context for the first
+        # thread, to avoid Firefox "can't open new page" errors.
+        if hasattr(self, '_initial_page') and self._initial_page is not None:
+            page = self._initial_page
+            self._initial_page = None
+        else:
+            page = await self._context.new_page()
+
+        async def _dismiss(d):
+            await d.dismiss()
+        page.on("dialog", _dismiss)
+
+        self._pages[tid] = page
+        self._element_maps[tid] = {}
+        log.info("Created new page for thread %s (total pages: %d).", tid, len(self._pages))
+        return page
+
+    async def _ensure_context(self) -> None:
+        """Start the browser context if not already running."""
+        if self._context is not None:
+            return
+
+        self._prepare_browser_runtime_dirs()
         self._log_launch_environment()
 
         last_exc: Exception | None = None
         for launch in self._candidate_launches():
             label = launch["label"]
             log.info("Starting Playwright and launching %s...", label)
-            self._prepare_chrome_runtime_dirs()
-            self._prepare_chrome_log_file()
+            self._prepare_browser_runtime_dirs()
+            self._prepare_browser_log_file()
             try:
                 await self._setup(launch=launch)
                 log.info("Browser ready (%s).", label)
-                return self._page
+                return
             except Exception as exc:
                 last_exc = exc
                 log.exception("Browser setup failed (%s): %s", label, exc)
-                self._log_chrome_stderr_tail()
+                self._log_browser_stderr_tail()
                 await self._cleanup_runtime()
 
-        raise RuntimeError("Unable to start browser context with Chrome.") from last_exc
+        raise RuntimeError("Unable to start browser context with Firefox.") from last_exc
 
     def _candidate_launches(self) -> list[dict[str, str]]:
         """Return Firefox launch candidates in order."""
@@ -205,9 +255,9 @@ class BrowserManager:
 
     def _browser_env(self, proxy_configured: bool) -> dict[str, str]:
         env = dict(os.environ)
-        env["CHROME_LOG_FILE"] = str(self._chrome_log_file)
-        env["TMPDIR"] = str(self._chrome_tmp_dir)
-        env["XDG_RUNTIME_DIR"] = str(self._chrome_runtime_dir)
+        env["BROWSER_LOG_FILE"] = str(self._browser_log_file)
+        env["TMPDIR"] = str(self._browser_tmp_dir)
+        env["XDG_RUNTIME_DIR"] = str(self._browser_runtime_dir)
         env.pop("DBUS_SESSION_BUS_ADDRESS", None)
         env.pop("DBUS_SYSTEM_BUS_ADDRESS", None)
         if proxy_configured:
@@ -252,7 +302,7 @@ class BrowserManager:
         # Use a persistent context so profile data lives in an explicit writable
         # directory instead of an implicit temp profile.
         self._context = await self._pw.firefox.launch_persistent_context(
-            user_data_dir=str(self._chrome_user_data_dir),
+            user_data_dir=str(self._browser_user_data_dir),
             **launch_options,
         )
         self._browser = self._context.browser
@@ -271,15 +321,18 @@ class BrowserManager:
         self._context.set_default_timeout(30_000)
         self._context.set_default_navigation_timeout(30_000)
 
+        # The persistent context may create an initial page automatically.
+        # Store it so the first ensure_page() call can reuse it instead of
+        # creating a new one (Firefox persistent contexts require at least
+        # one page to stay alive).
         pages = self._context.pages
         if pages:
-            self._page = pages[0]
+            self._initial_page = pages[0]
+            async def _dismiss(d):
+                await d.dismiss()
+            self._initial_page.on("dialog", _dismiss)
         else:
-            self._page = await self._context.new_page()
-
-        async def _dismiss(d):
-            await d.dismiss()
-        self._page.on("dialog", _dismiss)
+            self._initial_page = None
 
     def _get_proxy_and_launch_args(self) -> tuple[dict[str, str] | None, list[str]]:
         """Extract proxy config and build Firefox launch args.
@@ -295,8 +348,8 @@ class BrowserManager:
         )
 
         proxy: dict[str, str] | None = None
-        # Firefox uses fewer command-line flags than Chrome.
-        # Most hardening/rendering flags are Chrome-specific.
+        # Firefox uses fewer command-line flags than Chromium.
+        # Most hardening/rendering flags are Chromium-specific.
         launch_args: list[str] = []
 
         if proxy_url:
@@ -322,22 +375,22 @@ class BrowserManager:
 
         return proxy, launch_args
 
-    def _prepare_chrome_runtime_dirs(self) -> None:
-        """Ensure runtime directories used by Chrome exist and are writable."""
-        fallback_root = Path("/tmp/chrome-runtime")
-        self._chrome_tmp_dir = self._ensure_writable_dir(
-            self._chrome_tmp_dir, fallback_root / "tmp"
+    def _prepare_browser_runtime_dirs(self) -> None:
+        """Ensure runtime directories used by the browser exist and are writable."""
+        fallback_root = Path("/tmp/browser-runtime")
+        self._browser_tmp_dir = self._ensure_writable_dir(
+            self._browser_tmp_dir, fallback_root / "tmp"
         )
-        self._chrome_user_data_dir = self._ensure_writable_dir(
-            self._chrome_user_data_dir, fallback_root / "user-data"
+        self._browser_user_data_dir = self._ensure_writable_dir(
+            self._browser_user_data_dir, fallback_root / "user-data"
         )
-        self._chrome_runtime_dir = self._ensure_writable_dir(
-            self._chrome_runtime_dir, fallback_root / "xdg-runtime"
+        self._browser_runtime_dir = self._ensure_writable_dir(
+            self._browser_runtime_dir, fallback_root / "xdg-runtime"
         )
-        self._chrome_crash_dir = self._ensure_writable_dir(
-            self._chrome_crash_dir, fallback_root / "crash"
+        self._browser_crash_dir = self._ensure_writable_dir(
+            self._browser_crash_dir, fallback_root / "crash"
         )
-        self._ensure_writable_dir(self._chrome_tmp_dir / "cache", fallback_root / "tmp" / "cache")
+        self._ensure_writable_dir(self._browser_tmp_dir / "cache", fallback_root / "tmp" / "cache")
 
     def _ensure_writable_dir(self, preferred: Path, fallback: Path) -> Path:
         for path in (preferred, fallback):
@@ -351,9 +404,9 @@ class BrowserManager:
                 log.warning("Failed to prepare runtime dir %s: %s", path, exc)
         return fallback
 
-    def _prepare_chrome_log_file(self) -> None:
+    def _prepare_browser_log_file(self) -> None:
         """Ensure the browser log file exists and is empty for this launch attempt."""
-        path = self._chrome_log_file
+        path = self._browser_log_file
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("")
@@ -368,11 +421,11 @@ class BrowserManager:
             os.getgid(),
         )
         try:
-            tmp_free_mb = shutil.disk_usage(self._chrome_tmp_dir).free // (1024 * 1024)
+            tmp_free_mb = shutil.disk_usage(self._browser_tmp_dir).free // (1024 * 1024)
             root_free_mb = shutil.disk_usage("/").free // (1024 * 1024)
             log.info(
                 "Storage: tmp=%s free=%sMB root_free=%sMB",
-                self._chrome_tmp_dir,
+                self._browser_tmp_dir,
                 tmp_free_mb,
                 root_free_mb,
             )
@@ -399,9 +452,9 @@ class BrowserManager:
             except Exception as exc:
                 log.warning("Failed to read Firefox version for %s (%s): %s", name, path, exc)
 
-    def _log_chrome_stderr_tail(self) -> None:
+    def _log_browser_stderr_tail(self) -> None:
         """Log the tail of the browser log file if present."""
-        path = self._chrome_log_file
+        path = self._browser_log_file
         if not path.exists():
             return
         try:
@@ -415,20 +468,28 @@ class BrowserManager:
 
     @property
     def element_map(self) -> dict[int, dict]:
-        return self._element_map
+        """Return the element map for the default thread (backward compat)."""
+        return self._element_maps.get(self._DEFAULT_THREAD, {})
+
+    def element_map_for(self, thread_id: str | None = None) -> dict[int, dict]:
+        """Return the element map for the given thread."""
+        tid = thread_id or self._DEFAULT_THREAD
+        return self._element_maps.get(tid, {})
 
     # ----- snapshot ----------------------------------------------------------
 
-    async def take_snapshot(self, max_text_length: int = 5000) -> str:
+    async def take_snapshot(self, thread_id: str | None = None,
+                            max_text_length: int = 5000) -> str:
         """Build a text representation of the current page state."""
-        page = await self.ensure_page()
+        tid = thread_id or self._DEFAULT_THREAD
+        page = await self.ensure_page(tid)
 
         url = page.url
         title = await page.title()
 
         # Collect interactive elements
-        elements = await self._collect_interactive_elements()
-        self._element_map = {e["index"]: e for e in elements}
+        elements = await self._collect_interactive_elements(tid)
+        self._element_maps[tid] = {e["index"]: e for e in elements}
 
         lines: list[str] = []
         lines.append(f"URL: {url}")
@@ -470,9 +531,9 @@ class BrowserManager:
 
         return "\n".join(lines)
 
-    async def _collect_interactive_elements(self) -> list[dict]:
+    async def _collect_interactive_elements(self, thread_id: str | None = None) -> list[dict]:
         """Query the DOM for interactive elements and return structured info."""
-        page = await self.ensure_page()
+        page = await self.ensure_page(thread_id)
 
         # JavaScript that runs in the browser to enumerate interactive elements.
         # Returns a JSON-serialisable list.
@@ -640,16 +701,19 @@ class BrowserManager:
 
     async def resolve_element(self, element_index: int | None = None,
                               selector: str | None = None,
-                              text: str | None = None) -> Any:
+                              text: str | None = None,
+                              thread_id: str | None = None) -> Any:
         """Resolve an element from index, selector, or text match."""
-        page = await self.ensure_page()
+        tid = thread_id or self._DEFAULT_THREAD
+        page = await self.ensure_page(tid)
 
         if element_index is not None:
-            el_info = self._element_map.get(element_index)
+            el_map = self._element_maps.get(tid, {})
+            el_info = el_map.get(element_index)
             if not el_info:
                 raise ValueError(
                     f"Element index {element_index} not found. "
-                    f"Valid indices: 1-{len(self._element_map)}. "
+                    f"Valid indices: 1-{len(el_map)}. "
                     "Call get_page_snapshot to refresh the element list."
                 )
             # Use the CSS selector if we have one, otherwise reconstruct
@@ -684,11 +748,15 @@ class BrowserManager:
 
     async def _cleanup_runtime(self) -> None:
         """Best-effort close of all Playwright resources, resets handles."""
-        try:
-            if self._page:
-                await self._page.close()
-        except Exception:
-            pass
+        for tid, page in list(self._pages.items()):
+            try:
+                if page and not page.is_closed():
+                    await page.close()
+            except Exception:
+                pass
+        self._pages.clear()
+        self._element_maps.clear()
+
         try:
             if self._context:
                 await self._context.close()
@@ -705,7 +773,6 @@ class BrowserManager:
         except Exception:
             pass
 
-        self._page = None
         self._context = None
         self._browser = None
         self._pw = None
@@ -728,7 +795,7 @@ browser_mgr = BrowserManager()
 session_state = SessionState()
 
 
-def handle_navigate(args: dict) -> str:
+def handle_navigate(args: dict, thread_id: str) -> str:
     url = args.get("url")
     if not url:
         return json.dumps({"error": "url is required"})
@@ -739,7 +806,7 @@ def handle_navigate(args: dict) -> str:
 
     async def _do():
         try:
-            page = await browser_mgr.ensure_page()
+            page = await browser_mgr.ensure_page(thread_id)
         except Exception as exc:
             log.exception("Browser startup failed during navigate")
             return json.dumps({"error": f"Failed to start browser: {exc}"})
@@ -748,7 +815,7 @@ def handle_navigate(args: dict) -> str:
         except PlaywrightTimeout:
             return json.dumps({
                 "error": f"Timed out loading {url}. The page may still be loading.",
-                "partial_snapshot": await browser_mgr.take_snapshot(max_text_length=2000),
+                "partial_snapshot": await browser_mgr.take_snapshot(thread_id=thread_id, max_text_length=2000),
             })
         except Exception as exc:
             log.warning("Navigation to %s failed: %s", url, exc)
@@ -756,18 +823,18 @@ def handle_navigate(args: dict) -> str:
 
         return json.dumps({
             "status": "ok",
-            "snapshot": await browser_mgr.take_snapshot(),
+            "snapshot": await browser_mgr.take_snapshot(thread_id=thread_id),
         })
 
     return run_in_pw_thread(_do)
 
 
-def handle_get_page_snapshot(args: dict) -> str:
+def handle_get_page_snapshot(args: dict, thread_id: str) -> str:
     max_len = args.get("max_text_length", 5000)
 
     async def _do():
         try:
-            snapshot = await browser_mgr.take_snapshot(max_text_length=max_len)
+            snapshot = await browser_mgr.take_snapshot(thread_id=thread_id, max_text_length=max_len)
         except Exception as exc:
             log.exception("Browser startup failed during get_page_snapshot")
             return json.dumps({"error": f"Failed to get page snapshot: {exc}"})
@@ -778,13 +845,14 @@ def handle_get_page_snapshot(args: dict) -> str:
     return run_in_pw_thread(_do)
 
 
-def handle_click(args: dict) -> str:
+def handle_click(args: dict, thread_id: str) -> str:
     async def _do():
         try:
             locator = await browser_mgr.resolve_element(
                 element_index=args.get("element_index"),
                 selector=args.get("selector"),
                 text=args.get("text"),
+                thread_id=thread_id,
             )
         except ValueError as exc:
             return json.dumps({"error": str(exc)})
@@ -792,25 +860,25 @@ def handle_click(args: dict) -> str:
         try:
             await locator.click(timeout=10_000)
             # Wait briefly for potential navigation or DOM changes
-            page = await browser_mgr.ensure_page()
+            page = await browser_mgr.ensure_page(thread_id)
             await page.wait_for_load_state("domcontentloaded", timeout=5_000)
         except PlaywrightTimeout:
             pass  # Page may not navigate — that's fine
         except Exception as exc:
             return json.dumps({
                 "error": f"Click failed: {exc}",
-                "snapshot": await browser_mgr.take_snapshot(max_text_length=2000),
+                "snapshot": await browser_mgr.take_snapshot(thread_id=thread_id, max_text_length=2000),
             })
 
         return json.dumps({
             "status": "ok",
-            "snapshot": await browser_mgr.take_snapshot(),
+            "snapshot": await browser_mgr.take_snapshot(thread_id=thread_id),
         })
 
     return run_in_pw_thread(_do)
 
 
-def handle_fill(args: dict) -> str:
+def handle_fill(args: dict, thread_id: str) -> str:
     value = args.get("value")
     if value is None:
         return json.dumps({"error": "value is required"})
@@ -822,6 +890,7 @@ def handle_fill(args: dict) -> str:
             locator = await browser_mgr.resolve_element(
                 element_index=args.get("element_index"),
                 selector=args.get("selector"),
+                thread_id=thread_id,
             )
         except ValueError as exc:
             return json.dumps({"error": str(exc)})
@@ -842,12 +911,13 @@ def handle_fill(args: dict) -> str:
     return run_in_pw_thread(_do)
 
 
-def handle_select_option(args: dict) -> str:
+def handle_select_option(args: dict, thread_id: str) -> str:
     async def _do():
         try:
             locator = await browser_mgr.resolve_element(
                 element_index=args.get("element_index"),
                 selector=args.get("selector"),
+                thread_id=thread_id,
             )
         except ValueError as exc:
             return json.dumps({"error": str(exc)})
@@ -870,13 +940,13 @@ def handle_select_option(args: dict) -> str:
     return run_in_pw_thread(_do)
 
 
-def handle_press_key(args: dict) -> str:
+def handle_press_key(args: dict, thread_id: str) -> str:
     key = args.get("key")
     if not key:
         return json.dumps({"error": "key is required"})
 
     async def _do():
-        page = await browser_mgr.ensure_page()
+        page = await browser_mgr.ensure_page(thread_id)
 
         # Optionally focus an element first
         el_index = args.get("element_index")
@@ -886,6 +956,7 @@ def handle_press_key(args: dict) -> str:
                 locator = await browser_mgr.resolve_element(
                     element_index=el_index,
                     selector=selector,
+                    thread_id=thread_id,
                 )
                 await locator.focus(timeout=5_000)
             except Exception as exc:
@@ -903,18 +974,18 @@ def handle_press_key(args: dict) -> str:
 
         return json.dumps({
             "status": "ok",
-            "snapshot": await browser_mgr.take_snapshot(),
+            "snapshot": await browser_mgr.take_snapshot(thread_id=thread_id),
         })
 
     return run_in_pw_thread(_do)
 
 
-def handle_scroll(args: dict) -> str:
+def handle_scroll(args: dict, thread_id: str) -> str:
     direction = args.get("direction", "down")
     amount = args.get("amount", "page")
 
     async def _do():
-        page = await browser_mgr.ensure_page()
+        page = await browser_mgr.ensure_page(thread_id)
 
         if amount == "page":
             pixels = 960  # match viewport height
@@ -935,15 +1006,15 @@ def handle_scroll(args: dict) -> str:
 
         return json.dumps({
             "status": "ok",
-            "snapshot": await browser_mgr.take_snapshot(),
+            "snapshot": await browser_mgr.take_snapshot(thread_id=thread_id),
         })
 
     return run_in_pw_thread(_do)
 
 
-def handle_go_back(args: dict) -> str:
+def handle_go_back(args: dict, thread_id: str) -> str:
     async def _do():
-        page = await browser_mgr.ensure_page()
+        page = await browser_mgr.ensure_page(thread_id)
         try:
             await page.go_back(wait_until="domcontentloaded", timeout=15_000)
         except PlaywrightTimeout:
@@ -953,13 +1024,13 @@ def handle_go_back(args: dict) -> str:
 
         return json.dumps({
             "status": "ok",
-            "snapshot": await browser_mgr.take_snapshot(),
+            "snapshot": await browser_mgr.take_snapshot(thread_id=thread_id),
         })
 
     return run_in_pw_thread(_do)
 
 
-def handle_wait(args: dict) -> str:
+def handle_wait(args: dict, thread_id: str) -> str:
     selector = args.get("selector")
     if not selector:
         return json.dumps({"error": "selector is required"})
@@ -967,7 +1038,7 @@ def handle_wait(args: dict) -> str:
     timeout_sec = args.get("timeout_seconds", 10)
 
     async def _do():
-        page = await browser_mgr.ensure_page()
+        page = await browser_mgr.ensure_page(thread_id)
 
         try:
             await page.wait_for_selector(selector, timeout=timeout_sec * 1000)
@@ -986,13 +1057,13 @@ def handle_wait(args: dict) -> str:
     return run_in_pw_thread(_do)
 
 
-def handle_execute_javascript(args: dict) -> str:
+def handle_execute_javascript(args: dict, thread_id: str) -> str:
     script = args.get("script")
     if not script:
         return json.dumps({"error": "script is required"})
 
     async def _do():
-        page = await browser_mgr.ensure_page()
+        page = await browser_mgr.ensure_page(thread_id)
         try:
             result = await page.evaluate(script)
             return json.dumps({
@@ -1005,7 +1076,7 @@ def handle_execute_javascript(args: dict) -> str:
     return run_in_pw_thread(_do)
 
 
-def handle_save_state(args: dict) -> str:
+def handle_save_state(args: dict, thread_id: str) -> str:
     key = args.get("key")
     value = args.get("value")
     if key is None:
@@ -1021,7 +1092,7 @@ def handle_save_state(args: dict) -> str:
     })
 
 
-def handle_load_state(args: dict) -> str:
+def handle_load_state(args: dict, thread_id: str) -> str:
     return json.dumps({
         "state": session_state.get_all(),
     })
@@ -1067,7 +1138,8 @@ class CapabilityServicer(capability_pb2_grpc.CapabilityServicer):
 
     def Invoke(self, request, context):
         tool = request.tool_name
-        log.info("Invoke: %s", tool)
+        thread_id = request.thread_id or ""
+        log.info("Invoke: %s (thread=%s)", tool, thread_id[:12] if thread_id else "default")
 
         handler = TOOL_HANDLERS.get(tool)
         if not handler:
@@ -1105,7 +1177,12 @@ class CapabilityServicer(capability_pb2_grpc.CapabilityServicer):
                 )
 
         try:
-            result = handler(args)
+            result = handler(args, thread_id)
+        except TimeoutError as exc:
+            log.error("Tool %s timed out: %s", tool, exc)
+            return capability_pb2.InvokeResponse(
+                error=f"Tool '{tool}' timed out: {exc}"
+            )
         except Exception as exc:
             log.exception("Tool %s raised an exception", tool)
             return capability_pb2.InvokeResponse(
@@ -1152,7 +1229,10 @@ def serve() -> None:
 
     log.info("Stopping gRPC server...")
     server.stop(grace=5)
-    run_in_pw_thread(browser_mgr.close)
+    try:
+        run_in_pw_thread(browser_mgr.close, timeout=10)
+    except TimeoutError:
+        log.warning("Browser close timed out during shutdown.")
     _pw_loop.call_soon_threadsafe(_pw_loop.stop)
     _pw_thread.join(timeout=5)
     log.info("Server stopped.")
