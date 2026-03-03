@@ -891,6 +891,13 @@ class BrowserManager:
             el_map = self._element_maps.get(tid, {})
             el_info = el_map.get(element_index)
             if not el_info:
+                if not el_map:
+                    raise ValueError(
+                        f"Element index {element_index} not found — the element map is empty "
+                        "(the page may have been restarted after a browser crash). "
+                        "Call get_page_snapshot first to rebuild the element list, "
+                        "then retry with the new element indices."
+                    )
                 raise ValueError(
                     f"Element index {element_index} not found. "
                     f"Valid indices: 1-{len(el_map)}. "
@@ -1036,6 +1043,9 @@ def handle_click(args: dict, thread_id: str) -> str:
             )
         except ValueError as exc:
             return json.dumps({"error": str(exc)})
+        except Exception as exc:
+            log.exception("Browser error during click element resolution")
+            return json.dumps({"error": f"Failed to resolve element: {exc}"})
 
         try:
             await locator.click(timeout=10_000)
@@ -1074,6 +1084,9 @@ def handle_fill(args: dict, thread_id: str) -> str:
             )
         except ValueError as exc:
             return json.dumps({"error": str(exc)})
+        except Exception as exc:
+            log.exception("Browser error during fill element resolution")
+            return json.dumps({"error": f"Failed to resolve element: {exc}"})
 
         try:
             if clear_first:
@@ -1101,6 +1114,9 @@ def handle_select_option(args: dict, thread_id: str) -> str:
             )
         except ValueError as exc:
             return json.dumps({"error": str(exc)})
+        except Exception as exc:
+            log.exception("Browser error during select_option element resolution")
+            return json.dumps({"error": f"Failed to resolve element: {exc}"})
 
         value = args.get("value")
         label = args.get("label")
