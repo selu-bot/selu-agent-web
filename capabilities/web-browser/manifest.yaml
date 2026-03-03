@@ -183,6 +183,32 @@ tools:
         - script
     recommended_policy: ask
 
+  - name: search
+    description: >
+      Search the web for a query and return structured results. Uses the
+      SerpAPI service when a SERPAPI_API_KEY credential is configured, which
+      provides reliable results without bot-detection issues. Falls back to
+      performing the search directly in the browser when no API key is
+      available (may trigger CAPTCHAs on some search engines).
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: "The search query (e.g. 'best hotels in Paris')."
+        num_results:
+          type: integer
+          description: "Maximum number of results to return. Default 10."
+        search_engine:
+          type: string
+          description: "Search engine to use: 'google' (default) or 'duckduckgo'. Only affects SerpAPI mode."
+          enum:
+            - google
+            - duckduckgo
+      required:
+        - query
+    recommended_policy: allow
+
   - name: save_state
     description: >
       Save a key-value pair to session memory. Use this to remember your
@@ -217,7 +243,14 @@ network:
 
 filesystem: temp
 
-credentials: []
+credentials:
+  - name: SERPAPI_API_KEY
+    scope: system
+    description: >
+      API key for SerpAPI (https://serpapi.com). Enables reliable web search
+      without bot-detection issues. Optional — if not provided, the search
+      tool falls back to performing searches directly in the browser.
+    required: false
 
 resources:
   max_memory_mb: 1024

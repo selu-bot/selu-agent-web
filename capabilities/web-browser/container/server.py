@@ -18,7 +18,9 @@ import threading
 from concurrent import futures
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote_plus, unquote, urlencode, urlparse
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 import grpc
 import capability_pb2
@@ -1076,6 +1078,220 @@ def handle_execute_javascript(args: dict, thread_id: str) -> str:
     return run_in_pw_thread(_do)
 
 
+def handle_search(args: dict, thread_id: str) -> str:
+    query = args.get("query")
+    if not query:
+        return json.dumps({"error": "query is required"})
+
+    num_results = args.get("num_results", 10)
+    search_engine = args.get("search_engine", "google")
+
+    api_key = os.environ.get("SERPAPI_API_KEY", "").strip()
+
+    if api_key:
+        return _search_via_serpapi(query, num_results, search_engine, api_key)
+    else:
+        log.info("No SERPAPI_API_KEY set, falling back to browser-based search.")
+        return _search_via_browser(query, num_results, thread_id)
+
+
+def _search_via_serpapi(query: str, num_results: int, engine: str, api_key: str) -> str:
+    """Perform a search using SerpAPI and return structured results."""
+    params: dict[str, str | int] = {
+        "q": query,
+        "api_key": api_key,
+        "num": min(num_results, 20),
+    }
+
+    if engine == "duckduckgo":
+        params["engine"] = "duckduckgo"
+    else:
+        params["engine"] = "google"
+        params["gl"] = "de"
+        params["hl"] = "de"
+
+    url = f"https://serpapi.com/search?{urlencode(params)}"
+    log.info("SerpAPI search: engine=%s query=%r", engine, query)
+
+    try:
+        req = Request(url)
+        req.add_header("Accept", "application/json")
+        with urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        log.warning("SerpAPI HTTP error %d: %s", exc.code, body)
+        return json.dumps({
+            "error": f"SerpAPI returned HTTP {exc.code}",
+            "detail": body,
+        })
+    except (URLError, TimeoutError) as exc:
+        log.warning("SerpAPI request failed: %s", exc)
+        return json.dumps({"error": f"SerpAPI request failed: {exc}"})
+
+    # Extract organic results
+    results = []
+    for item in data.get("organic_results", [])[:num_results]:
+        result = {
+            "position": item.get("position"),
+            "title": item.get("title", ""),
+            "url": item.get("link", ""),
+            "snippet": item.get("snippet", ""),
+        }
+        # Include displayed link if available
+        displayed_link = item.get("displayed_link")
+        if displayed_link:
+            result["displayed_link"] = displayed_link
+        results.append(result)
+
+    # Include knowledge graph if present
+    knowledge_graph = data.get("knowledge_graph")
+    kg_summary = None
+    if knowledge_graph:
+        kg_summary = {
+            "title": knowledge_graph.get("title", ""),
+            "type": knowledge_graph.get("type", ""),
+            "description": knowledge_graph.get("description", ""),
+        }
+        # Include key attributes (address, phone, etc.)
+        for key in ("address", "phone", "website", "rating", "hours",
+                     "price", "review_count"):
+            val = knowledge_graph.get(key)
+            if val:
+                kg_summary[key] = val
+
+    # Include answer box if present
+    answer_box = data.get("answer_box")
+    answer = None
+    if answer_box:
+        answer = {
+            "type": answer_box.get("type", ""),
+            "title": answer_box.get("title", ""),
+            "answer": answer_box.get("answer", answer_box.get("snippet", "")),
+        }
+
+    response: dict[str, Any] = {
+        "status": "ok",
+        "source": "serpapi",
+        "engine": data.get("search_metadata", {}).get("google_url", ""),
+        "query": query,
+        "results": results,
+        "total_results": len(results),
+    }
+    if kg_summary:
+        response["knowledge_graph"] = kg_summary
+    if answer:
+        response["answer_box"] = answer
+
+    return json.dumps(response)
+
+
+def _search_via_browser(query: str, num_results: int, thread_id: str) -> str:
+    """Perform a search by navigating the browser to Google.
+
+    This is a fallback when no SerpAPI key is configured.  It may trigger
+    bot-detection / CAPTCHAs on Google or DuckDuckGo.
+    """
+    search_url = f"https://www.google.com/search?q={quote_plus(query)}&num={num_results}"
+
+    async def _do():
+        try:
+            page = await browser_mgr.ensure_page(thread_id)
+        except Exception as exc:
+            return json.dumps({"error": f"Failed to start browser: {exc}"})
+
+        try:
+            await page.goto(search_url, wait_until="domcontentloaded")
+        except PlaywrightTimeout:
+            pass
+        except Exception as exc:
+            return json.dumps({"error": f"Search navigation failed: {exc}"})
+
+        # Check for bot detection
+        try:
+            body = await page.inner_text("body") or ""
+        except Exception:
+            body = ""
+
+        bot_indicators = [
+            "unusual traffic", "automated queries",
+            "ungewöhnlichen datenverkehr", "/sorry/",
+        ]
+        is_blocked = any(ind in body.lower() for ind in bot_indicators)
+        if "/sorry/" in page.url:
+            is_blocked = True
+
+        if is_blocked:
+            return json.dumps({
+                "status": "blocked",
+                "source": "browser",
+                "query": query,
+                "message": (
+                    "Google blocked this search (bot detection). "
+                    "Configure a SERPAPI_API_KEY credential for reliable search, "
+                    "or try navigating to a specific website directly."
+                ),
+                "snapshot": await browser_mgr.take_snapshot(
+                    thread_id=thread_id, max_text_length=1000
+                ),
+            })
+
+        # Extract results from the page via JavaScript
+        results_js = """
+        () => {
+            const results = [];
+            // Google organic results
+            const items = document.querySelectorAll('div.g, div[data-hveid] div.tF2Cxc');
+            for (const item of items) {
+                const linkEl = item.querySelector('a[href]');
+                const titleEl = item.querySelector('h3');
+                const snippetEl = item.querySelector('[data-sncf], .VwiC3b, .IsZvec');
+                if (linkEl && titleEl) {
+                    results.push({
+                        title: titleEl.innerText || '',
+                        url: linkEl.href || '',
+                        snippet: snippetEl ? snippetEl.innerText || '' : '',
+                    });
+                }
+            }
+            return results;
+        }
+        """
+        try:
+            extracted = await page.evaluate(results_js)
+        except Exception:
+            extracted = []
+
+        if extracted:
+            for i, r in enumerate(extracted[:num_results], 1):
+                r["position"] = i
+            return json.dumps({
+                "status": "ok",
+                "source": "browser",
+                "query": query,
+                "results": extracted[:num_results],
+                "total_results": len(extracted[:num_results]),
+            })
+
+        # Fallback: return the page snapshot
+        return json.dumps({
+            "status": "ok",
+            "source": "browser",
+            "query": query,
+            "results": [],
+            "message": "Could not extract structured results. See snapshot.",
+            "snapshot": await browser_mgr.take_snapshot(
+                thread_id=thread_id, max_text_length=3000
+            ),
+        })
+
+    return run_in_pw_thread(_do)
+
+
 def handle_save_state(args: dict, thread_id: str) -> str:
     key = args.get("key")
     value = args.get("value")
@@ -1110,6 +1326,7 @@ TOOL_HANDLERS = {
     "go_back": handle_go_back,
     "wait": handle_wait,
     "execute_javascript": handle_execute_javascript,
+    "search": handle_search,
     "save_state": handle_save_state,
     "load_state": handle_load_state,
 }
@@ -1124,6 +1341,7 @@ TOOL_PRIMARY_PARAM: dict[str, str] = {
     "wait": "selector",
     "execute_javascript": "script",
     "fill": "value",
+    "search": "query",
 }
 
 
@@ -1146,6 +1364,18 @@ class CapabilityServicer(capability_pb2_grpc.CapabilityServicer):
             return capability_pb2.InvokeResponse(
                 error=f"Unknown tool: {tool}. Available: {', '.join(TOOL_HANDLERS.keys())}"
             )
+
+        # Parse credentials from config_json (injected by the orchestrator).
+        # These are made available as environment variables for the duration
+        # of this handler call so that handlers can read them via os.environ.
+        config: dict[str, str] = {}
+        if request.config_json:
+            try:
+                config = json.loads(request.config_json)
+                if not isinstance(config, dict):
+                    config = {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                log.warning("config_json was not valid JSON, ignoring.")
 
         try:
             args = json.loads(request.args_json) if request.args_json else {}
@@ -1177,7 +1407,18 @@ class CapabilityServicer(capability_pb2_grpc.CapabilityServicer):
                 )
 
         try:
-            result = handler(args, thread_id)
+            # Inject credentials from config_json as env vars for this call.
+            # Clean them up afterwards to avoid leaking across requests.
+            injected_keys: list[str] = []
+            for key, value in config.items():
+                if isinstance(value, str) and key not in os.environ:
+                    os.environ[key] = value
+                    injected_keys.append(key)
+            try:
+                result = handler(args, thread_id)
+            finally:
+                for key in injected_keys:
+                    os.environ.pop(key, None)
         except TimeoutError as exc:
             log.error("Tool %s timed out: %s", tool, exc)
             return capability_pb2.InvokeResponse(

@@ -12,6 +12,12 @@ You have access to a web browser through the `web-browser` capability.
 - `web-browser__scroll` — scroll the page up or down. Returns a page snapshot.
 - `web-browser__wait` — wait for an element to appear on the page.
 
+**Web search:**
+- `web-browser__search` — search the web for a query and return structured
+  results (titles, URLs, snippets). **Always prefer this over navigating to
+  Google/DuckDuckGo directly**, as search engines block automated browsers.
+  After searching, use `navigate` to visit any result URL you need.
+
 **Page reading:**
 - `web-browser__get_page_snapshot` — get the current page state: URL, title,
   numbered list of interactive elements, and visible text. This is your primary
@@ -69,3 +75,7 @@ visible area. You can also use CSS selectors or text matching as alternatives.
 - For date pickers, try `fill` first. If it does not work, use `click` to
   open the picker and interact with it step by step.
 - When filling forms, work through fields in order from top to bottom.
+- **Never navigate directly to google.com, duckduckgo.com, or other search
+  engines.** Use `web-browser__search` instead — it returns clean results
+  without triggering bot-detection CAPTCHAs.
+- After getting search results, use `navigate` to visit the URLs you need.

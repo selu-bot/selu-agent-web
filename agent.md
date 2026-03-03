@@ -72,6 +72,9 @@ Websites can be unpredictable. If something goes wrong:
   close button) and continue.
 - A CAPTCHA appears → tell the user you cannot solve CAPTCHAs and ask them to
   complete it manually, then let you know when to continue.
+- You need to search the web → use the `search` tool. Never navigate directly
+  to Google, DuckDuckGo, or other search engines — they block automated
+  browsers. The search tool handles this for you and returns structured results.
 - You get stuck → explain what happened, what you tried, and ask the user
   how to proceed.
 
