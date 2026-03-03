@@ -140,6 +140,22 @@ class BrowserManager:
         self._chrome_log_file = Path(
             os.environ.get("CHROME_LOG_FILE", "/tmp/chrome-debug.log")
         )
+        home_dir = Path(os.environ.get("HOME", "/tmp"))
+        state_root = Path(
+            os.environ.get("CHROME_STATE_DIR", str(home_dir / ".chrome-runtime"))
+        )
+        self._chrome_tmp_dir = Path(
+            os.environ.get("CHROME_TMP_DIR", str(state_root / "tmp"))
+        )
+        self._chrome_user_data_dir = Path(
+            os.environ.get("CHROME_USER_DATA_DIR", str(state_root / "user-data"))
+        )
+        self._chrome_runtime_dir = Path(
+            os.environ.get("CHROME_RUNTIME_DIR", str(state_root / "xdg-runtime"))
+        )
+        self._chrome_crash_dir = Path(
+            os.environ.get("CHROME_CRASH_DIR", str(state_root / "crash"))
+        )
 
     async def ensure_page(self) -> AsyncPage:
         """Lazily start the browser on first use."""
@@ -150,12 +166,14 @@ class BrowserManager:
             log.warning("Existing page is closed; resetting browser runtime.")
             await self._cleanup_runtime()
 
+        self._prepare_chrome_runtime_dirs()
         self._log_launch_environment()
 
         last_exc: Exception | None = None
         for launch in self._candidate_launches():
             label = launch["label"]
             log.info("Starting Playwright and launching %s...", label)
+            self._prepare_chrome_runtime_dirs()
             self._prepare_chrome_log_file()
             try:
                 await self._setup(launch=launch)
@@ -200,6 +218,10 @@ class BrowserManager:
     def _browser_env(self, proxy_configured: bool) -> dict[str, str]:
         env = dict(os.environ)
         env["CHROME_LOG_FILE"] = str(self._chrome_log_file)
+        env["TMPDIR"] = str(self._chrome_tmp_dir)
+        env["XDG_RUNTIME_DIR"] = str(self._chrome_runtime_dir)
+        env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+        env.pop("DBUS_SYSTEM_BUS_ADDRESS", None)
         if proxy_configured:
             for key in (
                 "HTTP_PROXY",
@@ -279,6 +301,8 @@ class BrowserManager:
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
+            "--disable-gpu-compositing",
+            "--disable-accelerated-2d-canvas",
             "--disable-extensions",
             "--disable-blink-features=AutomationControlled",
             "--no-first-run",
@@ -287,6 +311,12 @@ class BrowserManager:
             "--disable-component-update",
             "--disable-domain-reliability",
             "--disable-quic",
+            "--use-gl=swiftshader",
+            "--use-angle=swiftshader",
+            "--enable-unsafe-swiftshader",
+            "--in-process-gpu",
+            f"--crash-dumps-dir={self._chrome_crash_dir}",
+            f"--disk-cache-dir={self._chrome_tmp_dir / 'cache'}",
             "--enable-logging",
             f"--log-file={self._chrome_log_file}",
         ]
@@ -316,6 +346,35 @@ class BrowserManager:
 
         return proxy, launch_args
 
+    def _prepare_chrome_runtime_dirs(self) -> None:
+        """Ensure runtime directories used by Chrome exist and are writable."""
+        fallback_root = Path("/tmp/chrome-runtime")
+        self._chrome_tmp_dir = self._ensure_writable_dir(
+            self._chrome_tmp_dir, fallback_root / "tmp"
+        )
+        self._chrome_user_data_dir = self._ensure_writable_dir(
+            self._chrome_user_data_dir, fallback_root / "user-data"
+        )
+        self._chrome_runtime_dir = self._ensure_writable_dir(
+            self._chrome_runtime_dir, fallback_root / "xdg-runtime"
+        )
+        self._chrome_crash_dir = self._ensure_writable_dir(
+            self._chrome_crash_dir, fallback_root / "crash"
+        )
+        self._ensure_writable_dir(self._chrome_tmp_dir / "cache", fallback_root / "tmp" / "cache")
+
+    def _ensure_writable_dir(self, preferred: Path, fallback: Path) -> Path:
+        for path in (preferred, fallback):
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                probe = path / ".write-test"
+                probe.write_text("ok")
+                probe.unlink(missing_ok=True)
+                return path
+            except Exception as exc:
+                log.warning("Failed to prepare runtime dir %s: %s", path, exc)
+        return fallback
+
     def _prepare_chrome_log_file(self) -> None:
         """Ensure CHROME_LOG_FILE exists and is empty for this launch attempt."""
         path = self._chrome_log_file
@@ -334,6 +393,17 @@ class BrowserManager:
             os.getgid(),
             channel,
         )
+        try:
+            tmp_free_mb = shutil.disk_usage(self._chrome_tmp_dir).free // (1024 * 1024)
+            root_free_mb = shutil.disk_usage("/").free // (1024 * 1024)
+            log.info(
+                "Storage: chrome_tmp=%s free=%sMB root_free=%sMB",
+                self._chrome_tmp_dir,
+                tmp_free_mb,
+                root_free_mb,
+            )
+        except Exception as exc:
+            log.warning("Could not read disk usage for temp dirs: %s", exc)
 
         chrome_bins = [
             "google-chrome",
@@ -727,8 +797,13 @@ def handle_get_page_snapshot(args: dict) -> str:
     max_len = args.get("max_text_length", 5000)
 
     async def _do():
+        try:
+            snapshot = await browser_mgr.take_snapshot(max_text_length=max_len)
+        except Exception as exc:
+            log.exception("Browser startup failed during get_page_snapshot")
+            return json.dumps({"error": f"Failed to get page snapshot: {exc}"})
         return json.dumps({
-            "snapshot": await browser_mgr.take_snapshot(max_text_length=max_len),
+            "snapshot": snapshot,
         })
 
     return run_in_pw_thread(_do)
