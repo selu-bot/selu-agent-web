@@ -1,5 +1,5 @@
 # ---- Stage 1: Build gRPC stubs from proto ----
-FROM --platform=linux/amd64 python:3.12-slim AS builder
+fFROM python:3.12-slim AS builder
 
 WORKDIR /build
 
@@ -13,10 +13,11 @@ RUN python -m grpc_tools.protoc \
     --grpc_python_out=. \
     capability.proto
 
-# ---- Stage 2: Runtime with Playwright + real Google Chrome ----
-# Force amd64: Google Chrome does not ship for Linux ARM64.
-# On ARM hosts (e.g. Apple Silicon) this runs under Rosetta/QEMU emulation.
-FROM --platform=linux/amd64 mcr.microsoft.com/playwright/python:v1.52.0-noble
+# ---- Stage 2: Runtime with Playwright + Firefox ----
+# No platform constraint — runs natively on both amd64 and arm64.
+# Firefox is available on all Playwright-supported architectures and avoids
+# the bot-detection issues that plague headless Chromium.
+FROM mcr.microsoft.com/playwright/python:v1.52.0-noble
 
 WORKDIR /app
 
@@ -25,12 +26,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install real Google Chrome (not the bundled Chromium).
-# Real Chrome passes more anti-bot fingerprint checks than Playwright's
-# bundled Chromium, which is detected and blocked by services like
-# Akamai Bot Manager (e.g. disneylandparis.de).
-# --with-deps ensures system-level dependencies (fonts, libs) are installed.
-RUN playwright install --with-deps chrome
+# Install Firefox with system-level dependencies (fonts, libs).
+RUN playwright install --with-deps firefox
 
 # Copy generated gRPC stubs from builder
 COPY --from=builder /build/capability_pb2.py /build/capability_pb2_grpc.py ./

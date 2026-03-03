@@ -188,30 +188,18 @@ class BrowserManager:
         raise RuntimeError("Unable to start browser context with Chrome.") from last_exc
 
     def _candidate_launches(self) -> list[dict[str, str]]:
-        """Return Chrome launch candidates in order."""
-        preferred = os.environ.get("PLAYWRIGHT_CHANNEL", "chrome").strip()
+        """Return Firefox launch candidates in order."""
         launches: list[dict[str, str]] = [
-            {
-                "kind": "channel",
-                "value": preferred or "chrome",
-                "label": f"channel:{preferred or 'chrome'}",
-            }
+            {"kind": "default", "value": "", "label": "firefox:default"}
         ]
 
-        seen_execs: set[str] = set()
-        explicit_exec = os.environ.get("PLAYWRIGHT_CHROME_EXECUTABLE", "").strip()
-        for path in [explicit_exec, "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"]:
-            if not path or path in seen_execs:
-                continue
-            seen_execs.add(path)
-            if os.path.exists(path):
-                launches.append(
-                    {
-                        "kind": "executable",
-                        "value": path,
-                        "label": f"executable:{path}",
-                    }
-                )
+        explicit_exec = os.environ.get("PLAYWRIGHT_FIREFOX_EXECUTABLE", "").strip()
+        if explicit_exec and os.path.exists(explicit_exec):
+            launches.insert(0, {
+                "kind": "executable",
+                "value": explicit_exec,
+                "label": f"executable:{explicit_exec}",
+            })
 
         return launches
 
@@ -239,51 +227,62 @@ class BrowserManager:
     async def _setup(self, launch: dict[str, str]) -> None:
         """Full browser setup using the async Playwright API."""
         self._pw = await async_playwright().start()
-        log.info("Using Playwright Async API.")
+        log.info("Using Playwright Async API (Firefox).")
 
         proxy, launch_args = self._get_proxy_and_launch_args()
         launch_options: dict[str, Any] = {
             "headless": True,
             "args": launch_args,
             "env": self._browser_env(proxy_configured=bool(proxy)),
+            "viewport": {"width": 1280, "height": 960},
+            "user_agent": (
+                "Mozilla/5.0 (X11; Linux x86_64; rv:134.0) "
+                "Gecko/20100101 Firefox/134.0"
+            ),
+            "ignore_https_errors": True,
         }
-        if launch["kind"] == "channel":
-            launch_options["channel"] = launch["value"]
-        else:
+        if launch["kind"] == "executable":
+            launch_options["firefox_user_prefs"] = {
+                "browser.shell.checkDefaultBrowser": False,
+            }
             launch_options["executable_path"] = launch["value"]
         if proxy:
             launch_options["proxy"] = proxy
 
-        self._browser = await self._pw.chromium.launch(**launch_options)
-        if not self._browser.is_connected():
-            raise RuntimeError(
-                f"Browser disconnected immediately after launch ({launch['label']})."
+        # Use a persistent context so profile data lives in an explicit writable
+        # directory instead of an implicit temp profile.
+        self._context = await self._pw.firefox.launch_persistent_context(
+            user_data_dir=str(self._chrome_user_data_dir),
+            **launch_options,
+        )
+        self._browser = self._context.browser
+        if self._browser is not None:
+            if not self._browser.is_connected():
+                raise RuntimeError(
+                    f"Browser disconnected immediately after launch ({launch['label']})."
+                )
+            self._browser.on(
+                "disconnected",
+                lambda: log.warning("Browser process disconnected."),
             )
-        self._browser.on(
-            "disconnected",
-            lambda: log.warning("Browser process disconnected."),
-        )
-
-        self._context = await self._browser.new_context(
-            viewport={"width": 1280, "height": 960},
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-            ),
-            ignore_https_errors=True,
-        )
+        else:
+            log.warning("Persistent context did not expose browser handle.")
 
         self._context.set_default_timeout(30_000)
         self._context.set_default_navigation_timeout(30_000)
 
-        self._page = await self._context.new_page()
+        pages = self._context.pages
+        if pages:
+            self._page = pages[0]
+        else:
+            self._page = await self._context.new_page()
 
         async def _dismiss(d):
             await d.dismiss()
         self._page.on("dialog", _dismiss)
 
     def _get_proxy_and_launch_args(self) -> tuple[dict[str, str] | None, list[str]]:
-        """Extract proxy config and build Chrome launch args.
+        """Extract proxy config and build Firefox launch args.
 
         Returns (proxy, launch_args), where proxy is a Playwright launch config
         dict or None.
@@ -296,32 +295,9 @@ class BrowserManager:
         )
 
         proxy: dict[str, str] | None = None
-        launch_args = [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-gpu-compositing",
-            "--disable-accelerated-2d-canvas",
-            "--disable-extensions",
-            "--disable-blink-features=AutomationControlled",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-background-networking",
-            "--disable-component-update",
-            "--disable-domain-reliability",
-            "--disable-quic",
-            "--use-gl=swiftshader",
-            "--use-angle=swiftshader",
-            "--enable-unsafe-swiftshader",
-            "--in-process-gpu",
-            f"--crash-dumps-dir={self._chrome_crash_dir}",
-            f"--disk-cache-dir={self._chrome_tmp_dir / 'cache'}",
-            "--enable-logging",
-            f"--log-file={self._chrome_log_file}",
-        ]
-        if os.environ.get("CHROME_VERBOSE_LOGGING", "0") == "1":
-            launch_args.append("--v=1")
+        # Firefox uses fewer command-line flags than Chrome.
+        # Most hardening/rendering flags are Chrome-specific.
+        launch_args: list[str] = []
 
         if proxy_url:
             parsed = urlparse(proxy_url)
@@ -376,28 +352,26 @@ class BrowserManager:
         return fallback
 
     def _prepare_chrome_log_file(self) -> None:
-        """Ensure CHROME_LOG_FILE exists and is empty for this launch attempt."""
+        """Ensure the browser log file exists and is empty for this launch attempt."""
         path = self._chrome_log_file
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("")
         except Exception as exc:
-            log.warning("Failed to prepare Chrome log file %s: %s", path, exc)
+            log.warning("Failed to prepare browser log file %s: %s", path, exc)
 
     def _log_launch_environment(self) -> None:
-        """Emit environment details that matter for Chrome startup issues."""
-        channel = os.environ.get("PLAYWRIGHT_CHANNEL", "chrome")
+        """Emit environment details that matter for Firefox startup issues."""
         log.info(
-            "Launch environment: uid=%s gid=%s channel=%s",
+            "Launch environment: uid=%s gid=%s browser=firefox",
             os.getuid(),
             os.getgid(),
-            channel,
         )
         try:
             tmp_free_mb = shutil.disk_usage(self._chrome_tmp_dir).free // (1024 * 1024)
             root_free_mb = shutil.disk_usage("/").free // (1024 * 1024)
             log.info(
-                "Storage: chrome_tmp=%s free=%sMB root_free=%sMB",
+                "Storage: tmp=%s free=%sMB root_free=%sMB",
                 self._chrome_tmp_dir,
                 tmp_free_mb,
                 root_free_mb,
@@ -405,15 +379,10 @@ class BrowserManager:
         except Exception as exc:
             log.warning("Could not read disk usage for temp dirs: %s", exc)
 
-        chrome_bins = [
-            "google-chrome",
-            "google-chrome-stable",
-            "chrome",
-            "chrome-browser",
-        ]
-        found = [(name, shutil.which(name)) for name in chrome_bins if shutil.which(name)]
+        firefox_bins = ["firefox", "firefox-esr"]
+        found = [(name, shutil.which(name)) for name in firefox_bins if shutil.which(name)]
         if not found:
-            log.warning("No Chrome executable found on PATH.")
+            log.info("No Firefox executable found on PATH (Playwright will use its bundled copy).")
             return
 
         for name, path in found:
@@ -426,12 +395,12 @@ class BrowserManager:
                     timeout=5,
                 )
                 version = (proc.stdout or proc.stderr or "").strip()
-                log.info("Chrome binary: %s (%s) => %s", name, path, version or "unknown")
+                log.info("Firefox binary: %s (%s) => %s", name, path, version or "unknown")
             except Exception as exc:
-                log.warning("Failed to read Chrome version for %s (%s): %s", name, path, exc)
+                log.warning("Failed to read Firefox version for %s (%s): %s", name, path, exc)
 
     def _log_chrome_stderr_tail(self) -> None:
-        """Log the tail of CHROME_LOG_FILE if present."""
+        """Log the tail of the browser log file if present."""
         path = self._chrome_log_file
         if not path.exists():
             return
@@ -440,9 +409,9 @@ class BrowserManager:
             if not lines:
                 return
             tail = "\n".join(lines[-40:])
-            log.warning("Chrome log tail from %s:\n%s", path, tail)
+            log.warning("Browser log tail from %s:\n%s", path, tail)
         except Exception as exc:
-            log.warning("Failed to read Chrome log file %s: %s", path, exc)
+            log.warning("Failed to read browser log file %s: %s", path, exc)
 
     @property
     def element_map(self) -> dict[int, dict]:
