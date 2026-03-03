@@ -1,5 +1,5 @@
 # ---- Stage 1: Build gRPC stubs from proto ----
-fFROM python:3.12-slim AS builder
+FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
