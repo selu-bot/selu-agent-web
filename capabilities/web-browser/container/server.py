@@ -23,11 +23,18 @@ import capability_pb2_grpc
 
 from playwright.sync_api import (
     sync_playwright,
-    Browser,
-    BrowserContext,
-    Page,
-    Playwright,
+    Browser as SyncBrowser,
+    BrowserContext as SyncBrowserContext,
+    Page as SyncPage,
+    Playwright as SyncPlaywright,
     TimeoutError as PlaywrightTimeout,
+)
+from playwright.async_api import (
+    async_playwright,
+    Browser as AsyncBrowser,
+    BrowserContext as AsyncBrowserContext,
+    Page as AsyncPage,
+    Playwright as AsyncPlaywright,
 )
 
 logging.basicConfig(
@@ -57,17 +64,26 @@ _pw_thread_started = threading.Event()
 
 def _pw_thread_main() -> None:
     """Entry point for the Playwright worker thread."""
-    # Remove any inherited asyncio event loop so sync_playwright() works.
+    # Guarantee this thread has NO asyncio event loop.
+    #
+    # Playwright's sync_playwright() checks asyncio.get_running_loop() and
+    # refuses to start if one exists.  Various libraries (grpcio, uvloop,
+    # container init systems) may install or run an event loop on the main
+    # thread which can leak into child threads depending on the event loop
+    # policy.
+    #
+    # We install a fresh DefaultEventLoopPolicy so this thread's state is
+    # completely independent, then explicitly clear any event loop.
+    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
     asyncio.set_event_loop(None)
+
+    # Double-check: ensure no running loop is visible to this thread.
     try:
-        # Also try to close/unset any running loop (Python 3.12+).
-        loop = asyncio.get_event_loop_policy().get_event_loop()
-        if loop.is_running():
-            loop.stop()
-        loop.close()
-    except Exception:
-        pass
-    asyncio.set_event_loop(None)
+        asyncio.get_running_loop()
+        # If we get here, something very unusual is happening.
+        log.warning("Playwright thread still sees a running asyncio loop!")
+    except RuntimeError:
+        pass  # Expected — no running loop.
 
     _pw_thread_started.set()
     log.info("Playwright worker thread started.")
@@ -155,37 +171,143 @@ class BrowserManager:
     """
 
     def __init__(self) -> None:
-        self._pw: Playwright | None = None
-        self._browser: Browser | None = None
-        self._context: BrowserContext | None = None
-        self._page: Page | None = None
+        self._pw: SyncPlaywright | AsyncPlaywright | None = None
+        self._browser: SyncBrowser | AsyncBrowser | None = None
+        self._context: SyncBrowserContext | AsyncBrowserContext | None = None
+        self._page: SyncPage | AsyncPage | None = None
         self._cdp_session = None
         self._proxy_username: str | None = None
         self._proxy_password: str | None = None
         self._element_map: dict[int, dict] = {}
+        self._async_mode: bool = False
+        self._async_loop: asyncio.AbstractEventLoop | None = None
 
-    def _ensure_browser(self) -> Page:
+    def _ensure_browser(self) -> SyncPage | AsyncPage:
         """Lazily start the browser on first use."""
         if self._page is not None:
             return self._page
 
         log.info("Starting Playwright and launching Chrome...")
 
-        self._pw = sync_playwright().start()
+        # Try the sync API first.  If an asyncio event loop is running on
+        # this thread (e.g. injected by grpcio, uvloop, or the container
+        # runtime), sync_playwright() will raise.  In that case, fall back
+        # to the async API driven by a private event loop.
+        try:
+            self._pw = sync_playwright().start()
+            log.info("Using Playwright Sync API.")
+        except Exception as sync_err:
+            if "Sync API inside the asyncio loop" in str(sync_err):
+                log.warning(
+                    "sync_playwright() blocked by asyncio loop; "
+                    "falling back to async API: %s", sync_err,
+                )
+                self._async_mode = True
+                self._async_loop = asyncio.new_event_loop()
+                # Run the entire async setup in one shot so the event loop
+                # is running for all Playwright async operations (including
+                # event subscriptions like page.on()).
+                self._async_loop.run_until_complete(self._async_setup())
+                log.info("Browser ready (async mode).")
+                return self._page
+            else:
+                raise
 
-        # Respect egress proxy injected by the orchestrator.
-        # The URL contains credentials (e.g. http://selu:token@host:port).
-        #
-        # IMPORTANT: We do NOT use Playwright's proxy={username, password}
-        # parameter.  When credentials are passed that way, Playwright
-        # configures Chromium via CDP in a manner that causes certain
-        # sites (e.g. google.com) to hang — Chromium opens the CONNECT
-        # tunnel but never sends any data through it.
-        #
-        # Instead, we pass --proxy-server as a Chromium flag and handle
-        # the 407 Proxy Authentication challenge ourselves via the CDP
-        # Fetch domain (Fetch.authRequired event).  This is the same
-        # mechanism Chrome DevTools uses and works reliably with all sites.
+        # ----- Sync path: same setup as the original code --------------------
+        self._launch_browser()
+        log.info("Browser ready.")
+        return self._page
+
+    async def _async_setup(self) -> None:
+        """Full browser setup using the async Playwright API."""
+        self._pw = await async_playwright().start()
+        log.info("Using Playwright Async API (fallback).")
+
+        proxy_url, launch_args = self._get_proxy_and_launch_args()
+
+        self._browser = await self._pw.chromium.launch(
+            headless=True,
+            channel="chrome",
+            args=launch_args,
+        )
+
+        self._context = await self._browser.new_context(
+            viewport={"width": 1280, "height": 960},
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            ignore_https_errors=True,
+        )
+
+        self._context.set_default_timeout(30_000)
+        self._context.set_default_navigation_timeout(30_000)
+
+        self._page = await self._context.new_page()
+
+        async def _dismiss(d):
+            await d.dismiss()
+        self._page.on("dialog", _dismiss)
+
+        if self._proxy_username:
+            await self._async_setup_cdp_proxy_auth(self._page)
+
+    async def _async_setup_cdp_proxy_auth(self, page) -> None:
+        """Async version of CDP proxy auth setup."""
+        cdp = await page.context.new_cdp_session(page)
+        self._cdp_session = cdp
+
+        username = self._proxy_username
+        password = self._proxy_password
+
+        async def on_auth_required(event: dict) -> None:
+            challenge = event.get("authChallenge", {})
+            request_id = event.get("requestId")
+            if challenge.get("source") == "Proxy":
+                log.debug("CDP: proxy auth challenge for %s", request_id)
+                await cdp.send(
+                    "Fetch.continueWithAuth",
+                    {
+                        "requestId": request_id,
+                        "authChallengeResponse": {
+                            "response": "ProvideCredentials",
+                            "username": username,
+                            "password": password,
+                        },
+                    },
+                )
+            else:
+                log.debug("CDP: non-proxy auth challenge, cancelling: %s", challenge)
+                await cdp.send(
+                    "Fetch.continueWithAuth",
+                    {
+                        "requestId": request_id,
+                        "authChallengeResponse": {"response": "CancelAuth"},
+                    },
+                )
+
+        async def on_request_paused(event: dict) -> None:
+            request_id = event.get("requestId")
+            await cdp.send("Fetch.continueRequest", {"requestId": request_id})
+
+        cdp.on("Fetch.authRequired", on_auth_required)
+        cdp.on("Fetch.requestPaused", on_request_paused)
+
+        await cdp.send(
+            "Fetch.enable",
+            {
+                "handleAuthRequests": True,
+                "patterns": [{"requestStage": "Response"}],
+            },
+        )
+        log.info("CDP Fetch proxy auth handler installed.")
+
+    def _get_proxy_and_launch_args(self) -> tuple:
+        """Extract proxy config and build Chrome launch args.
+
+        Returns (proxy_url, launch_args).  Sets self._proxy_username/password
+        as a side-effect if a proxy is configured.
+        """
         proxy_url = (
             os.environ.get("HTTPS_PROXY")
             or os.environ.get("https_proxy")
@@ -204,7 +326,6 @@ class BrowserManager:
 
         if proxy_url:
             parsed = urlparse(proxy_url)
-            # Reconstruct server URL without embedded credentials
             server = f"{parsed.scheme}://{parsed.hostname}"
             if parsed.port:
                 server += f":{parsed.port}"
@@ -216,6 +337,12 @@ class BrowserManager:
                 server,
                 bool(parsed.username),
             )
+
+        return proxy_url, launch_args
+
+    def _launch_browser(self) -> None:
+        """Sync browser setup (shared between sync init path)."""
+        proxy_url, launch_args = self._get_proxy_and_launch_args()
 
         self._browser = self._pw.chromium.launch(
             headless=True,
@@ -232,26 +359,28 @@ class BrowserManager:
             ignore_https_errors=True,
         )
 
-        # Reasonable defaults for page loads
         self._context.set_default_timeout(30_000)
         self._context.set_default_navigation_timeout(30_000)
 
         self._page = self._context.new_page()
 
-        # Dismiss simple dialogs automatically
         self._page.on("dialog", lambda d: d.dismiss())
 
-        # Set up CDP Fetch domain for proxy authentication.
-        # Chromium follows RFC 7235: it sends CONNECT without credentials,
-        # expects a 407 with Proxy-Authenticate, and retries with creds.
-        # We intercept the 407 challenge via CDP and supply credentials.
         if self._proxy_username:
             self._setup_cdp_proxy_auth(self._page)
 
-        log.info("Browser ready.")
-        return self._page
+    def _maybe_await(self, obj):
+        """If in async mode, run a coroutine on the private event loop.
 
-    def _setup_cdp_proxy_auth(self, page: Page) -> None:
+        In sync mode, *obj* is already a concrete value (Playwright sync API
+        returns plain objects), so just return it.  In async mode, *obj* is a
+        coroutine that must be awaited.
+        """
+        if self._async_mode and asyncio.iscoroutine(obj):
+            return self._async_loop.run_until_complete(obj)
+        return obj
+
+    def _setup_cdp_proxy_auth(self, page) -> None:
         """Set up CDP Fetch domain to handle proxy 407 auth challenges.
 
         Instead of relying on Playwright's proxy={username, password} (which
@@ -259,18 +388,19 @@ class BrowserManager:
         CDP Fetch domain to intercept 407 challenges and respond with
         credentials programmatically.
         """
-        cdp = page.context.new_cdp_session(page)
+        cdp = self._maybe_await(page.context.new_cdp_session(page))
         self._cdp_session = cdp
 
         username = self._proxy_username
         password = self._proxy_password
+        maybe_await = self._maybe_await
 
         def on_auth_required(event: dict) -> None:
             challenge = event.get("authChallenge", {})
             request_id = event.get("requestId")
             if challenge.get("source") == "Proxy":
                 log.debug("CDP: proxy auth challenge for %s", request_id)
-                cdp.send(
+                maybe_await(cdp.send(
                     "Fetch.continueWithAuth",
                     {
                         "requestId": request_id,
@@ -280,36 +410,36 @@ class BrowserManager:
                             "password": password,
                         },
                     },
-                )
+                ))
             else:
                 # Not a proxy challenge — cancel so the browser handles it
                 log.debug("CDP: non-proxy auth challenge, cancelling: %s", challenge)
-                cdp.send(
+                maybe_await(cdp.send(
                     "Fetch.continueWithAuth",
                     {
                         "requestId": request_id,
                         "authChallengeResponse": {"response": "CancelAuth"},
                     },
-                )
+                ))
 
         def on_request_paused(event: dict) -> None:
             request_id = event.get("requestId")
-            cdp.send("Fetch.continueRequest", {"requestId": request_id})
+            maybe_await(cdp.send("Fetch.continueRequest", {"requestId": request_id}))
 
         cdp.on("Fetch.authRequired", on_auth_required)
         cdp.on("Fetch.requestPaused", on_request_paused)
 
-        cdp.send(
+        self._maybe_await(cdp.send(
             "Fetch.enable",
             {
                 "handleAuthRequests": True,
                 "patterns": [{"requestStage": "Response"}],
             },
-        )
+        ))
         log.info("CDP Fetch proxy auth handler installed.")
 
     @property
-    def page(self) -> Page:
+    def page(self):
         return self._ensure_browser()
 
     @property
@@ -323,7 +453,7 @@ class BrowserManager:
         page = self.page
 
         url = page.url
-        title = page.title()
+        title = self._maybe_await(page.title())
 
         # Collect interactive elements
         elements = self._collect_interactive_elements()
@@ -345,7 +475,7 @@ class BrowserManager:
         lines.append("=== Page Text ===")
 
         try:
-            text = page.inner_text("body") or ""
+            text = self._maybe_await(page.inner_text("body")) or ""
         except Exception:
             text = ""
 
@@ -457,7 +587,7 @@ class BrowserManager:
         """
 
         try:
-            raw = page.evaluate(js)
+            raw = self._maybe_await(page.evaluate(js))
         except Exception as exc:
             log.warning("Failed to collect interactive elements: %s", exc)
             return []
@@ -570,7 +700,7 @@ class BrowserManager:
             # Try common patterns: links, buttons, then any visible text
             for role in ["link", "button"]:
                 loc = page.get_by_role(role, name=text)
-                if loc.count() > 0:
+                if self._maybe_await(loc.count()) > 0:
                     return loc.first
             # Fall back to text match
             return page.get_by_text(text, exact=False).first
@@ -585,24 +715,26 @@ class BrowserManager:
         log.info("Closing browser...")
         try:
             if self._cdp_session:
-                self._cdp_session.detach()
+                self._maybe_await(self._cdp_session.detach())
         except Exception:
             pass
         try:
             if self._context:
-                self._context.close()
+                self._maybe_await(self._context.close())
         except Exception:
             pass
         try:
             if self._browser:
-                self._browser.close()
+                self._maybe_await(self._browser.close())
         except Exception:
             pass
         try:
             if self._pw:
-                self._pw.stop()
+                self._maybe_await(self._pw.stop())
         except Exception:
             pass
+        if self._async_loop:
+            self._async_loop.close()
         log.info("Browser closed.")
 
 
@@ -615,6 +747,9 @@ class BrowserManager:
 
 browser_mgr = BrowserManager()
 session_state = SessionState()
+
+# Shorthand for browser_mgr._maybe_await — keeps handler code concise.
+_ma = browser_mgr._maybe_await
 
 
 def handle_navigate(args: dict) -> str:
@@ -629,7 +764,7 @@ def handle_navigate(args: dict) -> str:
     def _do():
         page = browser_mgr.page
         try:
-            page.goto(url, wait_until="domcontentloaded")
+            _ma(page.goto(url, wait_until="domcontentloaded"))
         except PlaywrightTimeout:
             return json.dumps({
                 "error": f"Timed out loading {url}. The page may still be loading.",
@@ -670,9 +805,9 @@ def handle_click(args: dict) -> str:
             return json.dumps({"error": str(exc)})
 
         try:
-            locator.click(timeout=10_000)
+            _ma(locator.click(timeout=10_000))
             # Wait briefly for potential navigation or DOM changes
-            browser_mgr.page.wait_for_load_state("domcontentloaded", timeout=5_000)
+            _ma(browser_mgr.page.wait_for_load_state("domcontentloaded", timeout=5_000))
         except PlaywrightTimeout:
             pass  # Page may not navigate — that's fine
         except Exception as exc:
@@ -707,9 +842,9 @@ def handle_fill(args: dict) -> str:
 
         try:
             if clear_first:
-                locator.fill(value, timeout=10_000)
+                _ma(locator.fill(value, timeout=10_000))
             else:
-                locator.press_sequentially(value, delay=50, timeout=10_000)
+                _ma(locator.press_sequentially(value, delay=50, timeout=10_000))
         except Exception as exc:
             return json.dumps({"error": f"Fill failed: {exc}"})
 
@@ -736,9 +871,9 @@ def handle_select_option(args: dict) -> str:
 
         try:
             if label:
-                locator.select_option(label=label, timeout=10_000)
+                _ma(locator.select_option(label=label, timeout=10_000))
             elif value:
-                locator.select_option(value=value, timeout=10_000)
+                _ma(locator.select_option(value=value, timeout=10_000))
             else:
                 return json.dumps({"error": "Provide either 'value' or 'label'."})
         except Exception as exc:
@@ -766,15 +901,15 @@ def handle_press_key(args: dict) -> str:
                     element_index=el_index,
                     selector=selector,
                 )
-                locator.focus(timeout=5_000)
+                _ma(locator.focus(timeout=5_000))
             except Exception as exc:
                 return json.dumps({"error": f"Could not focus element: {exc}"})
 
         try:
-            page.keyboard.press(key)
+            _ma(page.keyboard.press(key))
             # Brief wait for any navigation or DOM update
             try:
-                page.wait_for_load_state("domcontentloaded", timeout=3_000)
+                _ma(page.wait_for_load_state("domcontentloaded", timeout=3_000))
             except PlaywrightTimeout:
                 pass
         except Exception as exc:
@@ -807,8 +942,8 @@ def handle_scroll(args: dict) -> str:
             pixels = -pixels
 
         try:
-            page.evaluate(f"window.scrollBy(0, {pixels})")
-            page.wait_for_timeout(500)  # let lazy-loaded content appear
+            _ma(page.evaluate(f"window.scrollBy(0, {pixels})"))
+            _ma(page.wait_for_timeout(500))  # let lazy-loaded content appear
         except Exception as exc:
             return json.dumps({"error": f"Scroll failed: {exc}"})
 
@@ -824,7 +959,7 @@ def handle_go_back(args: dict) -> str:
     def _do():
         page = browser_mgr.page
         try:
-            page.go_back(wait_until="domcontentloaded", timeout=15_000)
+            _ma(page.go_back(wait_until="domcontentloaded", timeout=15_000))
         except PlaywrightTimeout:
             pass
         except Exception as exc:
@@ -849,7 +984,7 @@ def handle_wait(args: dict) -> str:
         page = browser_mgr.page
 
         try:
-            page.wait_for_selector(selector, timeout=timeout_sec * 1000)
+            _ma(page.wait_for_selector(selector, timeout=timeout_sec * 1000))
             return json.dumps({
                 "status": "found",
                 "selector": selector,
@@ -873,7 +1008,7 @@ def handle_execute_javascript(args: dict) -> str:
     def _do():
         page = browser_mgr.page
         try:
-            result = page.evaluate(script)
+            result = _ma(page.evaluate(script))
             return json.dumps({
                 "status": "ok",
                 "result": result,
