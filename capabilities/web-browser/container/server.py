@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import signal
 import shutil
 import subprocess
@@ -1086,13 +1087,49 @@ def handle_search(args: dict, thread_id: str) -> str:
     num_results = args.get("num_results", 10)
     search_engine = args.get("search_engine", "google")
 
-    api_key = os.environ.get("SERPAPI_API_KEY", "").strip()
+    serpapi_key = os.environ.get("SERPAPI_API_KEY", "").strip()
+    brave_key = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
 
-    if api_key:
-        return _search_via_serpapi(query, num_results, search_engine, api_key)
+    # Build list of available API providers and shuffle so we distribute
+    # load across free-tier limits when both keys are present.
+    providers: list[tuple[str, str]] = []
+    if serpapi_key:
+        providers.append(("serpapi", serpapi_key))
+    if brave_key:
+        providers.append(("brave", brave_key))
+    random.shuffle(providers)
+
+    # Try each provider in turn; on failure (rate-limit, network error, etc.)
+    # transparently fall through to the next one.
+    last_error: str | None = None
+    for name, key in providers:
+        if name == "serpapi":
+            result = _search_via_serpapi(query, num_results, search_engine, key)
+        else:
+            result = _search_via_brave(query, num_results, key)
+
+        # Check whether the provider returned an error response.
+        try:
+            parsed = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            parsed = {}
+
+        if "error" not in parsed:
+            return result
+
+        # Provider failed — log and try the next one.
+        log.warning(
+            "Search provider %s failed: %s — trying next provider",
+            name, parsed.get("error", "unknown error"),
+        )
+        last_error = result
+
+    # All API providers failed (or none configured) — fall back to browser.
+    if last_error:
+        log.info("All search API providers failed, falling back to browser-based search.")
     else:
-        log.info("No SERPAPI_API_KEY set, falling back to browser-based search.")
-        return _search_via_browser(query, num_results, thread_id)
+        log.info("No search API key set, falling back to browser-based search.")
+    return _search_via_browser(query, num_results, thread_id)
 
 
 def _search_via_serpapi(query: str, num_results: int, engine: str, api_key: str) -> str:
@@ -1190,10 +1227,69 @@ def _search_via_serpapi(query: str, num_results: int, engine: str, api_key: str)
     return json.dumps(response)
 
 
+def _search_via_brave(query: str, num_results: int, api_key: str) -> str:
+    """Perform a search using the Brave Search API and return structured results."""
+    params: dict[str, str | int] = {
+        "q": query,
+        "count": min(num_results, 20),
+        "country": "DE",
+        "search_lang": "de",
+    }
+
+    url = f"https://api.search.brave.com/res/v1/web/search?{urlencode(params)}"
+    log.info("Brave Search: query=%r", query)
+
+    try:
+        req = Request(url)
+        req.add_header("Accept", "application/json")
+        req.add_header("Accept-Encoding", "identity")
+        req.add_header("X-Subscription-Token", api_key)
+        with urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        log.warning("Brave Search HTTP error %d: %s", exc.code, body)
+        return json.dumps({
+            "error": f"Brave Search returned HTTP {exc.code}",
+            "detail": body,
+        })
+    except (URLError, TimeoutError) as exc:
+        log.warning("Brave Search request failed: %s", exc)
+        return json.dumps({"error": f"Brave Search request failed: {exc}"})
+
+    # Extract web results
+    results = []
+    for i, item in enumerate(data.get("web", {}).get("results", [])[:num_results], 1):
+        result = {
+            "position": i,
+            "title": item.get("title", ""),
+            "url": item.get("url", ""),
+            "snippet": item.get("description", ""),
+        }
+        profile = item.get("profile")
+        if profile and profile.get("long_name"):
+            result["displayed_link"] = profile["long_name"]
+        results.append(result)
+
+    response: dict[str, Any] = {
+        "status": "ok",
+        "source": "brave",
+        "query": query,
+        "results": results,
+        "total_results": len(results),
+    }
+
+    return json.dumps(response)
+
+
 def _search_via_browser(query: str, num_results: int, thread_id: str) -> str:
     """Perform a search by navigating the browser to Google.
 
-    This is a fallback when no SerpAPI key is configured.  It may trigger
+    This is a fallback when no API search key is configured.  It may trigger
     bot-detection / CAPTCHAs on Google or DuckDuckGo.
     """
     search_url = f"https://www.google.com/search?q={quote_plus(query)}&num={num_results}"
@@ -1232,8 +1328,9 @@ def _search_via_browser(query: str, num_results: int, thread_id: str) -> str:
                 "query": query,
                 "message": (
                     "Google blocked this search (bot detection). "
-                    "Configure a SERPAPI_API_KEY credential for reliable search, "
-                    "or try navigating to a specific website directly."
+                    "Configure a SERPAPI_API_KEY or BRAVE_SEARCH_API_KEY credential "
+                    "for reliable search, or try navigating to a specific website "
+                    "directly."
                 ),
                 "snapshot": await browser_mgr.take_snapshot(
                     thread_id=thread_id, max_text_length=1000

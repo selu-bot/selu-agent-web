@@ -186,8 +186,10 @@ tools:
   - name: search
     description: >
       Search the web for a query and return structured results. Uses the
-      SerpAPI service when a SERPAPI_API_KEY credential is configured, which
-      provides reliable results without bot-detection issues. Falls back to
+      SerpAPI or Brave Search API when a corresponding API key credential is
+      configured, which provides reliable results without bot-detection issues.
+      If both keys are configured, one provider is chosen at random per
+      request to distribute load across free-tier limits. Falls back to
       performing the search directly in the browser when no API key is
       available (may trigger CAPTCHAs on some search engines).
     input_schema:
@@ -201,7 +203,7 @@ tools:
           description: "Maximum number of results to return. Default 10."
         search_engine:
           type: string
-          description: "Search engine to use: 'google' (default) or 'duckduckgo'. Only affects SerpAPI mode."
+          description: "Search engine to use: 'google' (default) or 'duckduckgo'. Only affects SerpAPI mode; Brave Search always uses its own index."
           enum:
             - google
             - duckduckgo
@@ -248,8 +250,20 @@ credentials:
     scope: system
     description: >
       API key for SerpAPI (https://serpapi.com). Enables reliable web search
-      without bot-detection issues. Optional — if not provided, the search
-      tool falls back to performing searches directly in the browser.
+      without bot-detection issues. Optional — if not provided and no
+      BRAVE_SEARCH_API_KEY is set either, the search tool falls back to
+      performing searches directly in the browser.
+    required: false
+
+  - name: BRAVE_SEARCH_API_KEY
+    scope: system
+    description: >
+      API key for Brave Search API (https://brave.com/search/api/). Enables
+      reliable web search without bot-detection issues. Optional — if not
+      provided and no SERPAPI_API_KEY is set either, the search tool falls
+      back to performing searches directly in the browser. When both keys
+      are configured, one provider is chosen at random per request to
+      distribute load across free-tier limits.
     required: false
 
 resources:
