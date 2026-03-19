@@ -1,13 +1,13 @@
 agent:
   name: Web-Assistent
-  description: Automatisiert echte Browser-Aufgaben wie Recherche, Formulare und Buchungsablaeufe.
-  long_description: Dieser Agent steuert einen echten Browser, navigiert Webseiten, fuellt Formulare aus, vergleicht Optionen und fuehrt mehrstufige Web-Ablaufe mit expliziten Nutzerbestaetigungen aus.
+  description: Automatisiert echte Browser-Aufgaben wie Recherche, Formulare und Buchungsabläufe.
+  long_description: Dieser Agent steuert einen echten Browser, navigiert Webseiten, füllt Formulare aus, vergleicht Optionen und führt mehrstufige Web-Ablaufe mit expliziten Nutzerbestätigungen aus.
 
 capabilities:
   web-browser:
     tools:
       navigate:
-        display_name: Webseite oeffnen
+        display_name: Webseite öffnen
         description: Navigiere zu einer URL und liefere einen aktuellen Seitensnapshot.
       get_page_snapshot:
         display_name: Aktuelle Seite lesen
@@ -16,32 +16,32 @@ capabilities:
         display_name: Element anklicken
         description: Klicke ein Seitenelement per Index, Selektor oder Text.
       fill:
-        display_name: Feld ausfuellen
+        display_name: Feld ausfüllen
         description: Schreibe Text in ein Eingabefeld oder eine Textarea.
       select_option:
-        display_name: Option waehlen
-        description: Waehle eine Option in einem Dropdown/Select.
+        display_name: Option wählen
+        description: Wähle eine Option in einem Dropdown/Select.
       press_key:
-        display_name: Taste druecken
-        description: Druecke eine Tastaturtaste, optional nach Fokus auf ein Element.
+        display_name: Taste drücken
+        description: Drücke eine Tastaturtaste, optional nach Fokus auf ein Element.
       scroll:
         display_name: Seite scrollen
         description: Scrolle nach oben oder unten, um weiteren Inhalt zu sehen.
       go_back:
-        display_name: Zurueckgehen
-        description: Gehe in der Browser-Historie zurueck.
+        display_name: Zurückgehen
+        description: Gehe in der Browser-Historie zurück.
       wait:
         display_name: Auf Element warten
         description: Warte, bis ein Selektor erscheint oder ein Timeout erreicht ist.
       execute_javascript:
-        display_name: JavaScript ausfuehren
-        description: Fuehre benutzerdefiniertes JavaScript auf der aktuellen Seite aus (nur als letzte Option).
+        display_name: JavaScript ausführen
+        description: Führe benutzerdefiniertes JavaScript auf der aktuellen Seite aus (nur als letzte Option).
       search:
         display_name: Websuche
-        description: Suche im Web und gib strukturierte Ergebnisse zurueck.
+        description: Suche im Web und gib strukturierte Ergebnisse zurück.
       save_state:
         display_name: Sitzungszustand speichern
-        description: Speichere Schluessel-Wert-Zustand fuer Kontinuitaet ueber mehrere Nachrichten.
+        description: Speichere Schlüssel-Wert-Zustand für Kontinuität über mehrere Nachrichten.
       load_state:
         display_name: Sitzungszustand laden
         description: Lade den zuvor gespeicherten Sitzungszustand.
@@ -49,5 +49,5 @@ capabilities:
 approval:
   tools:
     web-browser__execute_javascript:
-      label: JavaScript ausfuehren
-      message: Ich moechte einen benutzerdefinierten JavaScript-Code auf der aktuellen Seite ausfuehren.
+      label: JavaScript ausführen
+      message: Ich möchte einen benutzerdefinierten JavaScript-Code auf der aktüllen Seite ausführen.
