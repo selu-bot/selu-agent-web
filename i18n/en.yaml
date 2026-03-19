@@ -1,0 +1,53 @@
+agent:
+  name: Web Assistant
+  description: Automates real browser tasks like research, forms, and booking flows.
+  long_description: This agent controls a real browser to navigate websites, fill forms, compare options, and complete multi-step web workflows with explicit user confirmations.
+
+capabilities:
+  web-browser:
+    tools:
+      navigate:
+        display_name: Open website
+        description: Navigate the browser to a URL and return a fresh page snapshot.
+      get_page_snapshot:
+        display_name: Read current page
+        description: Return URL, title, interactive elements, and visible text from the current page.
+      click:
+        display_name: Click element
+        description: Click a page element by index, selector, or text.
+      fill:
+        display_name: Fill field
+        description: Type text into an input or textarea field.
+      select_option:
+        display_name: Select option
+        description: Choose an option in a dropdown/select element.
+      press_key:
+        display_name: Press key
+        description: Press a keyboard key, optionally after focusing an element.
+      scroll:
+        display_name: Scroll page
+        description: Scroll up or down to reveal more page content.
+      go_back:
+        display_name: Go back
+        description: Navigate back in browser history.
+      wait:
+        display_name: Wait for element
+        description: Wait until a selector appears or timeout is reached.
+      execute_javascript:
+        display_name: Execute JavaScript
+        description: Run custom JavaScript on the current page as a last resort.
+      search:
+        display_name: Search web
+        description: Search the web and return structured results.
+      save_state:
+        display_name: Save session state
+        description: Persist key-value state for continuity across messages.
+      load_state:
+        display_name: Load session state
+        description: Load all previously saved session state.
+
+approval:
+  tools:
+    web-browser__execute_javascript:
+      label: Execute JavaScript
+      message: I want to run a custom JavaScript snippet on the current page.

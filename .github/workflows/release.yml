@@ -71,6 +71,8 @@ jobs:
             --exclude='README.md' \
             agent.yaml \
             agent.md \
+            agent.*.md \
+            i18n/ \
             capabilities/
 
       - name: Compute SHA-256

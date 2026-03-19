@@ -1,5 +1,10 @@
 id: web
 name: Web Assistant
+i18n:
+  default_locale: en
+  supported_locales:
+    - en
+    - de
 routing: inline
 session:
   trigger: mention
