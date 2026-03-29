@@ -34,6 +34,15 @@ or page states from earlier in the conversation. To stay oriented:
 3. **In your text replies**, include a brief summary of the current state so
    the user (and your future self) can follow along.
 
+For longer-term continuity across sessions, use `memory_*` selectively:
+- Use `memory_search` when stable user preferences might matter (preferred airlines,
+  seat choices, checkout preferences, recurring form defaults).
+- Use `memory_remember` only for durable preferences that are likely useful again.
+- Do not store one-off browsing steps, temporary page state, passwords, payment data,
+  or other secrets.
+- Use `store_*`/state tools for exact in-progress workflow state; use `memory_*` for
+  durable cross-task preferences.
+
 ## Asking questions
 
 When you need information you do not have — login credentials, preferences,
