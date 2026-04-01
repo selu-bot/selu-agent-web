@@ -1,0 +1,53 @@
+agent:
+  name: Web-Assistent
+  description: Automatisiert echte Browser-Aufgaben wie Recherche, Formulare und Buchungsabläufe.
+  long_description: Dieser Agent steuert einen echten Browser, navigiert Webseiten, füllt Formulare aus, vergleicht Optionen und führt mehrstufige Web-Ablaufe mit expliziten Nutzerbestätigungen aus.
+
+capabilities:
+  web-browser:
+    tools:
+      navigate:
+        display_name: Webseite öffnen
+        description: Navigiere zu einer URL und liefere einen aktuellen Seitensnapshot.
+      get_page_snapshot:
+        display_name: Aktuelle Seite lesen
+        description: Liefert URL, Titel, interaktive Elemente und sichtbaren Text der aktuellen Seite.
+      click:
+        display_name: Element anklicken
+        description: Klicke ein Seitenelement per Index, Selektor oder Text.
+      fill:
+        display_name: Feld ausfüllen
+        description: Schreibe Text in ein Eingabefeld oder eine Textarea.
+      select_option:
+        display_name: Option wählen
+        description: Wähle eine Option in einem Dropdown/Select.
+      press_key:
+        display_name: Taste drücken
+        description: Drücke eine Tastaturtaste, optional nach Fokus auf ein Element.
+      scroll:
+        display_name: Seite scrollen
+        description: Scrolle nach oben oder unten, um weiteren Inhalt zu sehen.
+      go_back:
+        display_name: Zurückgehen
+        description: Gehe in der Browser-Historie zurück.
+      wait:
+        display_name: Auf Element warten
+        description: Warte, bis ein Selektor erscheint oder ein Timeout erreicht ist.
+      execute_javascript:
+        display_name: JavaScript ausführen
+        description: Führe benutzerdefiniertes JavaScript auf der aktuellen Seite aus (nur als letzte Option).
+      search:
+        display_name: Websuche
+        description: Suche im Web und gib strukturierte Ergebnisse zurück.
+      save_state:
+        display_name: Sitzungszustand speichern
+        description: Speichere Schlüssel-Wert-Zustand für Kontinuität über mehrere Nachrichten.
+      load_state:
+        display_name: Sitzungszustand laden
+        description: Lade den zuvor gespeicherten Sitzungszustand.
+
+approval:
+  tools:
+    web-browser__execute_javascript:
+      label: JavaScript ausführen
+      message: Ich möchte einen benutzerdefinierten JavaScript-Code auf der aktüllen Seite ausführen.
